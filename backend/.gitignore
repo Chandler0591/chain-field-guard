@@ -1,0 +1,12 @@
+# 依赖
+node_modules/
+
+# 本地环境配置(含敏感信息,不提交)
+.env
+
+# 钱包身份(私钥材料,永不入库;由 scripts/setup-wallet.js 生成)
+wallet/
+
+# 运行时产物
+logs/
+*.log

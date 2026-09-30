@@ -13,7 +13,7 @@ coverage/
 .vite/
 
 # ---- Hyperledger Fabric 生成物（含私钥，严禁提交） ----
-**/organizations/
+# 密钥材料由 network/.gitignore 精细化排除；脚本/配置模板需入库
 **/channel-artifacts/
 **/system-genesis-block/
 **/wallet/
@@ -31,3 +31,6 @@ coverage/
 .idea/
 .DS_Store
 Thumbs.db
+
+# ---- 本地验证用临时工具链(不入库) ----
+.toolchain/

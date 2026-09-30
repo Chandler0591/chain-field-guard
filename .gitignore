@@ -1,0 +1,30 @@
+# ---- Node.js ----
+node_modules/
+*.log
+npm-debug.log*
+yarn-error.log*
+.env
+.env.*
+
+# ---- 构建产物 ----
+dist/
+build/
+coverage/
+.vite/
+
+# ---- Hyperledger Fabric 生成物（含私钥，严禁提交） ----
+**/organizations/
+**/channel-artifacts/
+**/system-genesis-block/
+**/wallet/
+**/connection-profiles/generated/
+**/*.tar.gz
+
+# ---- IPFS 本地数据 ----
+**/.ipfs/
+**/ipfs-data/
+
+# ---- IDE / 系统 ----
+.idea/
+.DS_Store
+Thumbs.db

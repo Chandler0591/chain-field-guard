@@ -24,6 +24,9 @@ coverage/
 **/.ipfs/
 **/ipfs-data/
 
+# ---- 临时桥接目录 ----
+.tmp/
+
 # ---- IDE / 系统 ----
 .idea/
 .DS_Store

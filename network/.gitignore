@@ -15,5 +15,7 @@ addOrg3/fabric-ca/org3/*
 organizations/ordererOrganizations/*
 organizations/peerOrganizations/*
 system-genesis-block/*
+# 监控组件运行产物(Grafana 数据库由容器生成,不入库)
+prometheus-grafana/grafana_db/*
 *.tar.gz
 log.txt

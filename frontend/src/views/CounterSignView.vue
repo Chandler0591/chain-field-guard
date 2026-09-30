@@ -95,7 +95,13 @@ async function doCounterSign() {
               异常项:{{ batch.aiCheck.flags.join('、') }}。
             </template>
             <template v-else>无异常项。</template>
-            模型版本 {{ batch.aiCheck.modelVersion }},可继续签名或由录入人发起修改。
+            <template v-if="batch.aiCheck.riskLevel === 'HIGH'">
+              红色告警:存在高风险异常,强烈建议人工复核数据或由录入人发起修改后再签名!
+            </template>
+            <template v-else>
+              可继续签名或由录入人发起修改。
+            </template>
+            模型版本 {{ batch.aiCheck.modelVersion }}。
           </template>
         </el-alert>
 

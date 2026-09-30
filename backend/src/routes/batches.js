@@ -72,14 +72,18 @@ router.post(
 
 /**
  * POST /api/batches/:id/ai-check —— AI 预检(录入人)
- * 请求体:{ origin?, produceType?, pesticideResidue, heavyMetalPb, moisturePct }
+ * 请求体:{ origin?, produceType?, pesticideResidue, heavyMetalPb, moisturePct,
+ *           totalBacteria?, nitrite? }
  *   - pesticideResidue 农药残留(mg/kg,数值必填)
  *   - heavyMetalPb     重金属铅(mg/kg,数值必填)
  *   - moisturePct      水分含量(%,数值必填)
+ *   - totalBacteria    菌落总数(CFU/g,数值可选,提供时参与风险评分)
+ *   - nitrite          亚硝酸盐(mg/kg,数值可选,提供时参与风险评分)
  *   - origin/produceType 产地与产品类型(字符串,可选,写入报告留痕)
  * 后端流程(链下智能 + 链上存证):
- *   1. 链下 AI 服务分析结构化检测数据(默认规则引擎,可插拔替换真实模型);
- *   2. 完整分析报告(输入/阈值/结论/模型版本)上传 IPFS 留档;
+ *   1. 链下 AI 服务分析结构化检测数据(可插拔引擎:AI_PROVIDER=rule 内置
+ *      规则引擎 | http 外部模型服务;模型服务不可用时自动降级回退规则引擎);
+ *   2. 完整分析报告(输入/阈值/结论/引擎/模型版本)上传 IPFS 留档;
  *   3. 报告 CID + SHA-256 + 摘要结论(风险分/异常项/模型版本)随交易上链,
  *      链码 RecordAICheck 存证 —— AI 结论不改变批次状态机(仍为 ANCHORED)。
  */
@@ -90,11 +94,18 @@ router.post(
     const { id } = req.params;
     const sample = req.body ?? {};
 
-    // 1. 校验结构化检测数据(三个数值字段必填且非负;越界/非数字一律拒绝)
+    // 1. 校验结构化检测数据(前三个数值字段必填且非负;菌落总数/亚硝酸盐为
+    //    可选维度,提供时同样必须为非负数值;越界/非数字一律拒绝)
     for (const field of ['pesticideResidue', 'heavyMetalPb', 'moisturePct']) {
       const v = sample[field];
       if (typeof v !== 'number' || !Number.isFinite(v) || v < 0) {
         return res.status(400).json({ ok: false, error: `${field} 必须为非负数值(如 0.02)` });
+      }
+    }
+    for (const field of ['totalBacteria', 'nitrite']) {
+      const v = sample[field];
+      if (v !== undefined && (typeof v !== 'number' || !Number.isFinite(v) || v < 0)) {
+        return res.status(400).json({ ok: false, error: `${field} 必须为非负数值(如 1000000)` });
       }
     }
 
@@ -110,18 +121,26 @@ router.post(
       return res.status(409).json({ ok: false, error: `批次 ${id} 已完成 AI 预检,不允许重复执行` });
     }
 
-    // 3. 链下 AI 分析(默认规则引擎;接入真实模型时替换 ai.analyze 实现即可)
-    const analysis = await ai.analyze(sample);
+    // 3. 链下 AI 分析(可插拔引擎:AI_PROVIDER=rule 内置规则引擎 | http 外部模型
+    //    服务;http 模式服务不可用时自动降级回退规则引擎,结果带 degradedFrom)
+    const provider = ai.createProvider(config);
+    const analysis = await ai.analyze(sample, provider);
 
-    // 4. 完整报告上传 IPFS 并计算哈希(链上只锚定 CID + 哈希 + 摘要)
-    const report = ai.buildReport(id, sample, analysis, config.aiModelVersion);
+    // 4. 确定上链的模型版本:http 模式成功用模型侧版本;降级时标注降级来源,
+    //    保证监管方可追溯"这次判断用的是哪个引擎/模型"
+    const modelVersion = analysis.degradedFrom
+      ? `${config.aiModelVersion}(降级:模型服务不可用)`
+      : (analysis.modelVersion ?? config.aiModelVersion);
+
+    // 5. 完整报告上传 IPFS 并计算哈希(链上只锚定 CID + 哈希 + 摘要)
+    const report = ai.buildReport(id, sample, analysis, modelVersion);
     const { cid: reportCid } = await ipfs.upload(
       Buffer.from(report, 'utf8'),
       `ai-report-${id}.json`
     );
     const reportHash = crypto.createHash('sha256').update(report).digest('hex');
 
-    // 5. 结论哈希上链(RecordAICheck 存证,状态机不变)
+    // 6. 结论哈希上链(RecordAICheck 存证,状态机不变)
     const updated = await gateway.submitTx(
       req.role,
       'RecordAICheck',
@@ -130,18 +149,20 @@ router.post(
       reportHash,
       String(analysis.riskScore),
       JSON.stringify(analysis.flags),
-      config.aiModelVersion
+      modelVersion
     );
-    return ok(res, updated);
+    // 明细不入链(链上只存摘要),附在响应里供前端逐项展示
+    return ok(res, { ...updated, aiDetail: analysis.details });
   })
 );
 
 /**
  * GET /api/batches/:id/ai-check —— AI 预检查询(全角色,含监管方)
- * 返回:{ aiCheck, verified }
+ * 返回:{ aiCheck, verified, detail }
  *   aiCheck:链上存证的 AI 预检结论(未预检时为 null);
  *   verified:追溯核验 —— 后端从 IPFS 取回报告原文并重算 SHA-256,
- *             与链上锚定的 reportHash 比对,true=报告未被篡改,false=不一致。
+ *             与链上锚定的 reportHash 比对,true=报告未被篡改,false=不一致;
+ *   detail:从 IPFS 报告解析的各维度得分明细(指标/检测值/得分/档位,不入链)。
  */
 router.get(
   '/batches/:id/ai-check',
@@ -150,12 +171,19 @@ router.get(
     const batch = await gateway.evaluateTx(req.role, 'GetBatch', req.params.id);
     const aiCheck = batch.aiCheck ?? null;
     let verified = null;
+    let detail = [];
     if (aiCheck) {
       const report = await ipfs.download(aiCheck.reportCid);
       const hash = crypto.createHash('sha256').update(report).digest('hex');
       verified = hash === aiCheck.reportHash;
+      // 从报告原文解析明细(报告结构见 services/ai.js buildReport)
+      try {
+        detail = JSON.parse(report.toString('utf8')).result?.details ?? [];
+      } catch {
+        detail = []; // 报告解析失败不阻塞查询,verified 已提示异常
+      }
     }
-    return ok(res, { aiCheck, verified });
+    return ok(res, { aiCheck, verified, detail });
   })
 );
 

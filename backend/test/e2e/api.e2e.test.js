@@ -198,6 +198,74 @@ test('05 AI 预检查询:监管方可读且报告哈希可核验(追溯 AI 判�
 });
 
 // =============================================================================
+// 用例 5b:AI 预检扩展维度 —— 菌落总数(可选维度)参与评分,链码无需感知新维度
+// =============================================================================
+test('05b AI 预检扩展维度:菌落总数 1e6 → WARN 30 分,可选维度参与评分', { skip: !RUN_E2E }, async () => {
+  const batchId = `${ctx.batchId}-TB`; // 独立批次,不影响主流程用例
+  const content = makeContent(3);
+  const uploaded = await uploadFile(content, `report-${batchId}.txt`);
+  await apiOk('POST', '/batches', {
+    role: 'operator',
+    body: { batchId, dataCid: uploaded.cid, sha256: uploaded.sha256 },
+  });
+
+  const { data: batch } = await apiOk('POST', `/batches/${batchId}/ai-check`, {
+    role: 'operator',
+    body: {
+      origin: '山东寿光',
+      produceType: '叶菜类',
+      pesticideResidue: 0.001,
+      heavyMetalPb: 0.01,
+      moisturePct: 9,
+      totalBacteria: 1e6, // 可选维度:命中警示阈值(链码只存摘要,无需感知新维度)
+    },
+  });
+
+  assert.equal(batch.status, 'ANCHORED', 'AI 结论不改变状态机');
+  assert.equal(batch.aiCheck.riskScore, 30);
+  assert.equal(batch.aiCheck.riskLevel, 'WARN');
+  assert.deepEqual(batch.aiCheck.flags, ['菌落总数超标']);
+});
+
+// =============================================================================
+// 用例 5c:AI 预检 HIGH 场景 —— 严重阈值命中,响应附带得分明细(不入链)
+// =============================================================================
+test('05c AI 预检 HIGH 场景:农残 0.15 → HIGH 60 分,响应含得分明细', { skip: !RUN_E2E }, async () => {
+  const batchId = `${ctx.batchId}-HIGH`; // 独立批次,不影响主流程用例
+  const content = makeContent(4);
+  const uploaded = await uploadFile(content, `report-${batchId}.txt`);
+  await apiOk('POST', '/batches', {
+    role: 'operator',
+    body: { batchId, dataCid: uploaded.cid, sha256: uploaded.sha256 },
+  });
+
+  const { data: batch } = await apiOk('POST', `/batches/${batchId}/ai-check`, {
+    role: 'operator',
+    body: {
+      origin: '山东寿光',
+      produceType: '叶菜类',
+      pesticideResidue: 0.15, // 命中严重阈值 → 60 分 HIGH
+      heavyMetalPb: 0.02,
+      moisturePct: 9,
+    },
+  });
+
+  assert.equal(batch.status, 'ANCHORED', 'AI 结论不改变状态机');
+  assert.equal(batch.aiCheck.riskScore, 60);
+  assert.equal(batch.aiCheck.riskLevel, 'HIGH');
+  assert.deepEqual(batch.aiCheck.flags, ['农药残留严重超标']);
+  // 响应附带的得分明细(不入链,链上只存摘要)
+  assert.ok(Array.isArray(batch.aiDetail), '响应应附带各维度得分明细');
+  assert.equal(batch.aiDetail[0].metric, '农药残留');
+  assert.equal(batch.aiDetail[0].score, 60);
+
+  // 查询接口同样返回明细(从 IPFS 报告解析,监管追溯)
+  const { data: q } = await apiOk('GET', `/batches/${batchId}/ai-check`, { role: 'regulator' });
+  assert.equal(q.verified, true);
+  assert.ok(Array.isArray(q.detail) && q.detail.length === 1, '查询接口应从报告解析出明细');
+});
+
+// =============================================================================
 // 用例 6:核对签名 —— checker 后端签名、链上验签(ANCHORED → COUNTER_SIGNED)
 // =============================================================================
 test('06 核对签名:checker 签名后状态为 COUNTER_SIGNED,签名留痕', { skip: !RUN_E2E }, async () => {

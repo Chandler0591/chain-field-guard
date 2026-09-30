@@ -19,14 +19,18 @@ const batchId = ref(''); // 查询批次号
 const batch = ref(null); // 批次详情(状态 + aiCheck)
 const verified = ref(null); // 监管追溯核验结果(报告哈希是否一致)
 const checking = ref(false); // 预检提交中标记
+const detail = ref([]); // 各维度得分明细(指标/检测值/得分/档位,不入链)
 
-// 结构化检测数据表单(数值字段必填,单位与后端规则引擎一致)
+// 结构化检测数据表单(数值字段必填,单位与后端规则引擎一致;
+// 菌落总数/亚硝酸盐为可选维度,填了才参与风险评分)
 const form = ref({
   origin: '',
   produceType: '',
   pesticideResidue: null,
   heavyMetalPb: null,
   moisturePct: null,
+  totalBacteria: null,
+  nitrite: null,
 });
 
 /** 查询批次:拿到状态与已有 AI 存证 */
@@ -37,12 +41,14 @@ async function doQuery() {
   }
   batch.value = null;
   verified.value = null;
+  detail.value = [];
   try {
     batch.value = await getBatch(batchId.value.trim());
-    // 已预检的批次,额外查询报告哈希核验结果(监管追溯)
+    // 已预检的批次,额外查询报告哈希核验结果与得分明细(监管追溯)
     if (batch.value.aiCheck) {
       const res = await getAiCheck(batchId.value.trim());
       verified.value = res.verified;
+      detail.value = res.detail ?? [];
     }
   } catch (err) {
     ElMessage.error(err.message);
@@ -61,15 +67,24 @@ async function doAiCheck() {
   }
   checking.value = true;
   try {
-    const updated = await aiCheck(batch.value.batchId, {
+    // 组装提交数据:必填三字段 + 可选维度(填了才传)
+    const payload = {
       origin: form.value.origin,
       produceType: form.value.produceType,
       pesticideResidue: Number(form.value.pesticideResidue),
       heavyMetalPb: Number(form.value.heavyMetalPb),
       moisturePct: Number(form.value.moisturePct),
-    });
+    };
+    if (form.value.totalBacteria !== null && form.value.totalBacteria !== '') {
+      payload.totalBacteria = Number(form.value.totalBacteria);
+    }
+    if (form.value.nitrite !== null && form.value.nitrite !== '') {
+      payload.nitrite = Number(form.value.nitrite);
+    }
+    const updated = await aiCheck(batch.value.batchId, payload);
     batch.value = updated;
     verified.value = null; // 刚存证,核验标记留到查询接口
+    detail.value = updated.aiDetail ?? []; // 响应附带的得分明细,直接展示
     ElMessage.success('AI 预检完成,结论已哈希上链存证(状态机不变)');
   } catch (err) {
     ElMessage.error(err.message);
@@ -154,6 +169,24 @@ function levelTagType(level) {
               {{ batch.aiCheck.checkedAt }}(由 {{ batch.aiCheck.checkedBy }} 触发)
             </el-descriptions-item>
           </el-descriptions>
+
+          <!-- 各维度得分明细(不入链,从 IPFS 报告解析;命中维度的判定依据) -->
+          <el-table
+            v-if="detail.length"
+            :data="detail"
+            size="small"
+            border
+            class="detail-table"
+            empty-text="无异常维度"
+          >
+            <el-table-column prop="metric" label="指标" width="120" />
+            <el-table-column label="检测值" width="160">
+              <template #default="{ row }">{{ row.value }} {{ row.unit }}</template>
+            </el-table-column>
+            <el-table-column prop="score" label="贡献得分" width="100" />
+            <el-table-column prop="level" label="判定档位" />
+          </el-table>
+
           <div class="action-row">
             <el-button @click="doQuery">重新核验</el-button>
             <el-link type="primary" :href="ipfsUrl(batch.aiCheck.reportCid)" target="_blank">
@@ -183,6 +216,14 @@ function levelTagType(level) {
             <el-form-item label="水分含量(%)">
               <el-input-number v-model="form.moisturePct" :min="0" :step="0.5" :precision="2" />
               <span class="field-hint">合理区间 5% ~ 20%</span>
+            </el-form-item>
+            <el-form-item label="菌落总数(CFU/g,可选)">
+              <el-input-number v-model="form.totalBacteria" :min="0" :step="100000" :precision="0" />
+              <span class="field-hint">警示阈值 1000000,严重阈值 10000000</span>
+            </el-form-item>
+            <el-form-item label="亚硝酸盐(mg/kg,可选)">
+              <el-input-number v-model="form.nitrite" :min="0" :step="0.5" :precision="2" />
+              <span class="field-hint">警示阈值 2,严重阈值 20</span>
             </el-form-item>
             <el-form-item>
               <el-button type="primary" :loading="checking" @click="doAiCheck">
@@ -227,6 +268,10 @@ function levelTagType(level) {
 }
 .flag-tag {
   margin-right: 8px;
+}
+.detail-table {
+  margin: 12px 0;
+  max-width: 640px;
 }
 .no-flag {
   color: #67c23a;

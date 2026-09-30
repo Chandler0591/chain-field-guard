@@ -2,8 +2,9 @@
 # =============================================================================
 # 链田守护 · 端到端演示脚本
 #
-# 作用:一条命令跑通完整业务流(录入人上传锚定 → AI 预检存证 → 核对人签名 →
-#       录入人发起修改 → 审核人批准 → 审核人锁定发证 → 消费者验证 → 监管审计),
+# 作用:一条命令跑通完整业务流(录入人上传锚定 → AI 预检存证(WARN)→ HIGH
+#       风险告警闭环 → 核对人签名 → 录入人发起修改 → 审核人批准 → 审核人
+#       锁定发证 → 消费者验证 → 监管审计),
 #       每步打印结果,适合答辩/验收现场演示,也可作为"环境是否搭对"的验收用例。
 #
 # 前置条件(全部就绪后才能运行):
@@ -86,6 +87,49 @@ api "AI 预检完成(风险等级 WARN:标记「农药残留超标」,状态仍�
   -s -X POST "$API/batches/$BATCH_ID/ai-check?role=operator" \
   -H 'Content-Type: application/json' \
   -d '{"origin":"山东寿光","produceType":"叶菜类","pesticideResidue":0.03,"heavyMetalPb":0.02,"moisturePct":9}' >/dev/null
+
+# =============================================================================
+# 1.6. HIGH 风险场景:AI 红色告警 → 人工复核 → 发起修改 → 审核批准(闭环叙事)
+# =============================================================================
+step 1.6 "HIGH 风险场景:AI 红色告警 → 人工发起修改 → 审核批准(闭环)"
+
+HIGH_BATCH="DEMO-HIGH-$(date +%s)"
+
+# 上传 + 锚定一个独立批次(不影响主演示批次)
+printf '链田守护演示检验报告(HIGH 场景)\n批次:%s\n结论:待复核\n' \
+  "$HIGH_BATCH" > "$WORK_DIR/report-high.txt"
+UPLOAD_H=$(api "HIGH 场景文件上传 IPFS" -s -F "file=@$WORK_DIR/report-high.txt" "$API/upload?role=operator")
+CID_H=$(json_str cid "$UPLOAD_H")
+SHA_H=$(json_str sha256 "$UPLOAD_H")
+api "HIGH 批次 $HIGH_BATCH 锚定上链" \
+  -s -X POST "$API/batches?role=operator" \
+  -H 'Content-Type: application/json' \
+  -d "{\"batchId\":\"$HIGH_BATCH\",\"dataCid\":\"$CID_H\",\"sha256\":\"$SHA_H\"}" >/dev/null
+
+# 农残 0.15 mg/kg 命中严重阈值 → 60 分 HIGH(与主批次 WARN 形成对比)
+AI_H=$(api "AI 预检完成(农残 0.15 → HIGH 60 分,核对页红色告警)" \
+  -s -X POST "$API/batches/$HIGH_BATCH/ai-check?role=operator" \
+  -H 'Content-Type: application/json' \
+  -d '{"origin":"山东寿光","produceType":"叶菜类","pesticideResidue":0.15,"heavyMetalPb":0.02,"moisturePct":9}')
+RISK_LEVEL=$(json_str riskLevel "$AI_H")
+info "AI 风险等级: $RISK_LEVEL(核对人看到红色告警:「强烈建议人工复核或发起修改」)"
+
+# 人工决策:核对人要求录入人修正后再签名 —— 演示"AI 辅助、人工决策"
+step 1.7 "人工决策闭环:录入人发起修改,审核人批准(高风险数据被人工修正)"
+printf '链田守护演示检验报告(HIGH 场景修订版)\n批次:%s\n修订:农残复检合格\n' \
+  "$HIGH_BATCH" > "$WORK_DIR/report-high-v2.txt"
+UPLOAD_H2=$(api "HIGH 修订版上传 IPFS" -s -F "file=@$WORK_DIR/report-high-v2.txt" "$API/upload?role=operator")
+CID_H2=$(json_str cid "$UPLOAD_H2")
+SHA_H2=$(json_str sha256 "$UPLOAD_H2")
+api "HIGH 批次修改请求提交(PENDING)" \
+  -s -X POST "$API/batches/$HIGH_BATCH/modification-request?role=operator" \
+  -H 'Content-Type: application/json' \
+  -d "{\"newCid\":\"$CID_H2\",\"newSha256\":\"$SHA_H2\",\"reason\":\"AI 提示农残高风险,复检修正\"}" >/dev/null
+api "修改已批准(高风险数据已被人工修正)" \
+  -s -X POST "$API/batches/$HIGH_BATCH/modification-approve?role=auditor" \
+  -H 'Content-Type: application/json' \
+  -d '{"approved":true}' >/dev/null
+info "闭环完成:AI 告警 → 人工复核 → 发起修改 → 审核批准,AI 全程只辅助、不替代人工"
 
 # =============================================================================
 # 2. 核对人:核对签名(后端签名,链上验签)

@@ -41,7 +41,12 @@ export default {
   ipfsApiUrl: env('IPFS_API_URL', 'http://127.0.0.1:5001'),
 
   // ---- AI 异常检测(链下智能,见 services/ai.js)----
-  // 当前默认规则引擎;接入真实模型后升级此版本号即可让历史存证可区分
+  // 引擎可插拔:AI_PROVIDER=rule(默认规则引擎)| http(外部模型服务);
+  // http 模式下模型服务不可用时自动降级回退规则引擎(报告留痕)。
+  aiProvider: env('AI_PROVIDER', 'rule'),
+  aiModelUrl: env('AI_MODEL_URL', 'http://127.0.0.1:3100/analyze'),
+  aiModelTimeoutMs: Number(env('AI_MODEL_TIMEOUT_MS', '3000')),
+  // 规则引擎版本号,随 AI 预检报告一起锚定上链,便于追溯模型迭代
   aiModelVersion: env('AI_MODEL_VERSION', 'rule-engine-v1'),
 
   // ---- 各组织 peer 的网关连接参数 ----

@@ -12,6 +12,7 @@
 //      peer 收集背书,单连一个 peer 也能满足策略。
 // =============================================================================
 
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import grpc from '@grpc/grpc-js';
@@ -72,9 +73,13 @@ async function openSession(role) {
     client,
     identity: {
       mspId: identity.mspId,
-      credentials: identity.credentials,
+      // fabric-gateway 1.x 约定:credentials 是证书 PEM 的字节(Buffer),
+      // 会序列化为链上 SerializedIdentity.id_bytes(不是 {certificate, privateKey} 对象)。
+      credentials: Buffer.from(identity.credentials.certificate),
     },
-    signer: signers.newPrivateKeySigner(identity.credentials.privateKey),
+    // newPrivateKeySigner 要求 Node.js KeyObject(而非 PEM 字符串),
+    // 因此先经 crypto.createPrivateKey 转换(fabric-gateway 1.x 的约定)。
+    signer: signers.newPrivateKeySigner(crypto.createPrivateKey(identity.credentials.privateKey)),
     // 服务发现:自动发现通道内全部 peer 收集背书(asLocalhost 把发现的
     // docker 主机名重写为 localhost,与本机端口映射一致)
     discovery: { enabled: true, asLocalhost: true },

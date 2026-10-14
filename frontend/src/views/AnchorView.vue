@@ -110,7 +110,7 @@ async function doAnchor() {
       <!-- 步骤 2:锚定上链 -->
       <div class="step-block">
         <div class="step-title">② 锚定上链</div>
-        <el-form label-width="80px">
+        <el-form label-width="100px">
           <el-form-item label="批次号">
             <el-input
               v-model="batchId"

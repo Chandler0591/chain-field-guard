@@ -15,10 +15,13 @@ import { requireRole } from '../middleware/role.js';
 
 const router = Router();
 
-// multer:文件暂存内存(演示场景文件小);限制单文件 10MB 防误传
+// multer:文件暂存内存(演示场景文件小);限制单文件 10MB 防误传。
+// defParamCharset:浏览器以 UTF-8 发送 filename,而 busboy 默认按 latin1
+// 解码会导致中文文件名乱码,这里显式指定 utf8 修正。
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024 },
+  defParamCharset: 'utf8',
 });
 
 /**
@@ -53,6 +56,8 @@ router.post(
 /**
  * GET /api/ipfs/:cid —— 按 CID 从 IPFS 取回文件内容。
  * 任意角色可用(核对人预览、消费者核验文件)。
+ * 可选查询参数 filename:提供时设置 Content-Disposition(浏览器按该文件名
+ * 展示/下载);.json 结尾时以 application/json 返回,浏览器直接文本展示。
  */
 router.get(
   '/ipfs/:cid',
@@ -60,7 +65,21 @@ router.get(
   async (req, res) => {
     try {
       const content = await ipfs.download(req.params.cid);
-      res.setHeader('Content-Type', 'application/octet-stream');
+      const filename = typeof req.query.filename === 'string' ? req.query.filename : '';
+      if (filename) {
+        const isJson = filename.toLowerCase().endsWith('.json');
+        res.setHeader(
+          'Content-Type',
+          isJson ? 'application/json; charset=utf-8' : 'application/octet-stream'
+        );
+        // inline:浏览器优先直接展示;filename*=UTF-8'' 支持中文文件名
+        res.setHeader(
+          'Content-Disposition',
+          `inline; filename*=UTF-8''${encodeURIComponent(filename)}`
+        );
+      } else {
+        res.setHeader('Content-Type', 'application/octet-stream');
+      }
       res.setHeader('Content-Length', String(content.length));
       return res.send(content);
     } catch (err) {

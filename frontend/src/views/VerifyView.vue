@@ -63,7 +63,7 @@ async function doVerify() {
       </template>
 
       <!-- 输入区 -->
-      <el-form label-width="90px">
+      <el-form label-width="110px">
         <el-form-item label="批次号">
           <el-input v-model="batchId" placeholder="如 B2026-001" style="width: 320px" />
         </el-form-item>

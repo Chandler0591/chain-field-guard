@@ -165,4 +165,8 @@ body {
   max-width: 960px;
   margin: 0 auto;
 }
+/* 全局:descriptions 中长哈希/CID/凭证 ID 允许换行,避免撑破卡片出现横向滚动条 */
+.el-descriptions__content {
+  word-break: break-all;
+}
 </style>

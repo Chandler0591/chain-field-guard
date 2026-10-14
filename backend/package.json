@@ -10,8 +10,8 @@
   "scripts": {
     "start": "node src/server.js",
     "setup-wallet": "node scripts/setup-wallet.js",
-    "test": "node --test test/unit/",
-    "test:e2e": "node --test --test-concurrency=1 test/e2e/"
+    "test": "node --test \"test/unit/*.test.js\"",
+    "test:e2e": "node --test --test-concurrency=1 \"test/e2e/*.test.js\""
   },
   "dependencies": {
     "@grpc/grpc-js": "^1.12.2",

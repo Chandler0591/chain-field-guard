@@ -132,12 +132,13 @@ func currentVersion(batch *ProductBatch) (*BatchVersion, error) {
 	return &batch.Versions[batch.CurrentVersion-1], nil
 }
 
-// signPayload 重建核对人签名的数据包。
-// 规则:batchId + "|" + 当前版本 CID + "|" + 交易时间戳(Unix 秒)。
+// signPayload 重建签名数据包。
+// 规则:签名用途kind + "|" + batchId + "|" + 当前版本 CID + "|" + 交易时间戳(Unix 秒)。
+// kind 区分用途(签名通过/驳回),防同一签名跨用途重放;
 // 后端签名时必须使用完全相同的数据,链上验证才能通过。
 // 注意:payload 规则是安全契约的一部分,变更会导致历史签名无法验证。
-func signPayload(batchId, dataCid string, txSeconds int64) []byte {
-	return []byte(fmt.Sprintf(SignPayloadFormat, batchId, dataCid, txSeconds))
+func signPayload(kind, batchId, dataCid string, txSeconds int64) []byte {
+	return []byte(fmt.Sprintf(SignPayloadFormat, kind, batchId, dataCid, txSeconds))
 }
 
 // riskLevelOf 由风险评分派生风险等级(与后端 ai 服务规则完全一致,

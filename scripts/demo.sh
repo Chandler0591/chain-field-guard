@@ -3,9 +3,9 @@
 # 链田守护 · 端到端演示脚本
 #
 # 作用:一条命令跑通完整业务流(录入人上传锚定 → AI 预检存证(WARN)→ HIGH
-#       风险告警闭环 → 核对人签名 → 录入人发起修改 → 审核人批准 → 审核人
-#       锁定发证 → 消费者验证 → 监管审计),
-#       每步打印结果,适合答辩/验收现场演示,也可作为"环境是否搭对"的验收用例。
+#       风险告警 → 核对驳回 → 整改重提 → 重新预检 → 重新签名 → 锁定发证 →
+#       消费者验证 → 录入人发起修改 → 审核人批准 → 锁定发证 → 监管审计),
+#       每步打印结果,适合演示/验收现场,也可作为"环境是否搭对"的验收用例。
 #
 # 前置条件(全部就绪后才能运行):
 #   1. Fabric 网络已启动、链码已部署(见 network/README.md);
@@ -89,9 +89,9 @@ api "AI 预检完成(风险等级 WARN:标记「农药残留超标」,状态仍�
   -d '{"origin":"山东寿光","produceType":"叶菜类","pesticideResidue":0.03,"heavyMetalPb":0.02,"moisturePct":9}' >/dev/null
 
 # =============================================================================
-# 1.6. HIGH 风险场景:AI 红色告警 → 人工复核 → 发起修改 → 审核批准(闭环叙事)
+# 1.6. HIGH 风险场景:AI 红色告警(核对页红色风险提示)
 # =============================================================================
-step 1.6 "HIGH 风险场景:AI 红色告警 → 人工发起修改 → 审核批准(闭环)"
+step 1.6 "HIGH 风险场景:AI 红色告警(农残 0.15 → HIGH 60 分)"
 
 HIGH_BATCH="DEMO-HIGH-$(date +%s)"
 
@@ -114,22 +114,65 @@ AI_H=$(api "AI 预检完成(农残 0.15 → HIGH 60 分,核对页红色告警)" 
 RISK_LEVEL=$(json_str riskLevel "$AI_H")
 info "AI 风险等级: $RISK_LEVEL(核对人看到红色告警:「强烈建议人工复核或发起修改」)"
 
-# 人工决策:核对人要求录入人修正后再签名 —— 演示"AI 辅助、人工决策"
-step 1.7 "人工决策闭环:录入人发起修改,审核人批准(高风险数据被人工修正)"
-printf '链田守护演示检验报告(HIGH 场景修订版)\n批次:%s\n修订:农残复检合格\n' \
+# 人工决策闭环:核对人看到红色告警后人工认定不合格 → 核对驳回(附原因上链,
+# 状态 REJECTED)→ 未放行前消费者验证被拒 → 录入人整改重提(REJECTED →
+# ANCHORED)→ 重新 AI 预检(旧 HIGH 结论归档)→ 重新签名 → 锁定发证 ——
+# 演示"AI 辅助、人工决策"与"驳回不是死路,整改后仍可合格签发"。
+step 1.7 "人工决策闭环:HIGH 告警 → 核对驳回 → 整改重提 → 重新预检 → 合格签发"
+
+# 1) 核对人认定不合格 → 核对驳回(原因必填,链上留痕,状态 → REJECTED)
+REJ=$(api "核对驳回(核对人附原因驳回,状态 → REJECTED)" \
+  -s -X POST "$API/batches/$HIGH_BATCH/countersign-reject?role=checker" \
+  -H 'Content-Type: application/json' \
+  -d '{"reason":"农残严重超标(0.15 mg/kg),退回整改"}')
+REJ_STATUS=$(json_str status "$REJ")
+info "批次状态: $REJ_STATUS(驳回原因已链上留痕)"
+
+# 2) 未真正放行前消费者验证必须被拒(未签发数字凭证,不可对外验证)
+VERIFY_REJ=$(curl -s -X POST "$API/verify/$HIGH_BATCH?role=regulator" \
+  -H 'Content-Type: application/json' \
+  -d "{\"sha256\":\"$SHA_H\"}")
+if grep -q '"ok":false' <<<"$VERIFY_REJ"; then
+  ok "REJECTED 状态消费者验证被正确拒绝(未签发数字凭证,不可对外验证)"
+else
+  printf "${RED}  ✘ REJECTED 状态验证不应通过!响应:${NC} %s\n" "$VERIFY_REJ"
+  exit 1
+fi
+
+# 3) 录入人整改:上传整改版文件 → 整改重提(状态 REJECTED → ANCHORED)
+printf '链田守护演示检验报告(HIGH 场景整改版)\n批次:%s\n整改:农残复检合格\n' \
   "$HIGH_BATCH" > "$WORK_DIR/report-high-v2.txt"
-UPLOAD_H2=$(api "HIGH 修订版上传 IPFS" -s -F "file=@$WORK_DIR/report-high-v2.txt" "$API/upload?role=operator")
+UPLOAD_H2=$(api "HIGH 整改版上传 IPFS" -s -F "file=@$WORK_DIR/report-high-v2.txt" "$API/upload?role=operator")
 CID_H2=$(json_str cid "$UPLOAD_H2")
 SHA_H2=$(json_str sha256 "$UPLOAD_H2")
-api "HIGH 批次修改请求提交(PENDING)" \
-  -s -X POST "$API/batches/$HIGH_BATCH/modification-request?role=operator" \
+api "整改重提成功(状态 REJECTED → ANCHORED,新版本追加、旧版本归档)" \
+  -s -X POST "$API/batches/$HIGH_BATCH/resubmit?role=operator" \
   -H 'Content-Type: application/json' \
-  -d "{\"newCid\":\"$CID_H2\",\"newSha256\":\"$SHA_H2\",\"reason\":\"AI 提示农残高风险,复检修正\"}" >/dev/null
-api "修改已批准(高风险数据已被人工修正)" \
-  -s -X POST "$API/batches/$HIGH_BATCH/modification-approve?role=auditor" \
+  -d "{\"newCid\":\"$CID_H2\",\"newSha256\":\"$SHA_H2\",\"reason\":\"已复检整改:农残达标\"}" >/dev/null
+
+# 4) 重新 AI 预检(整改后达标数据 → NORMAL,旧 HIGH 结论自动归档 aiChecks)
+AI_H2=$(api "重新预检完成(整改后 NORMAL,旧 HIGH 结论归档链上保留)" \
+  -s -X POST "$API/batches/$HIGH_BATCH/ai-check?role=operator" \
   -H 'Content-Type: application/json' \
-  -d '{"approved":true}' >/dev/null
-info "闭环完成:AI 告警 → 人工复核 → 发起修改 → 审核批准,AI 全程只辅助、不替代人工"
+  -d '{"origin":"山东寿光","produceType":"叶菜类","pesticideResidue":0.001,"heavyMetalPb":0.01,"moisturePct":9}')
+RISK_LEVEL2=$(json_str riskLevel "$AI_H2")
+info "整改后 AI 风险等级: $RISK_LEVEL2"
+
+# 5) 重新核对签名 + 锁定发证(整改后可合格签发)
+api "重新核对签名通过(状态 → COUNTER_SIGNED)" \
+  -s -X POST "$API/batches/$HIGH_BATCH/countersign?role=checker" >/dev/null
+FINAL_H=$(api "锁定发证(状态 → FINALIZED,驳回整改后也能合格签发)" \
+  -s -X POST "$API/batches/$HIGH_BATCH/finalize?role=auditor")
+CREDENTIAL_H=$(json_str credentialId "$FINAL_H")
+info "HIGH 批次凭证 ID: $CREDENTIAL_H"
+
+# 6) 真正放行后消费者验证整改版 MATCH
+api "整改版文件哈希核验 MATCH(真正放行后才可对外验证)" \
+  -s -X POST "$API/verify/$HIGH_BATCH?role=regulator" \
+  -H 'Content-Type: application/json' \
+  -d "{\"sha256\":\"$SHA_H2\"}" >/dev/null
+
+info "闭环完成:AI 告警 → 人工驳回 → 整改重提 → 重新预检 → 重新签名 → 合格签发,AI 全程只辅助、不替代人工"
 
 # =============================================================================
 # 2. 核对人:核对签名(后端签名,链上验签)

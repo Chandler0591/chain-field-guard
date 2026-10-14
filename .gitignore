@@ -34,3 +34,11 @@ Thumbs.db
 
 # ---- 本地验证用临时工具链(不入库) ----
 .toolchain/
+
+# ---- 链码部署产物(vendor 由 deployCC 现场 go mod vendor 生成) ----
+chaincode/agrichain/vendor/
+
+# ---- 本地临时文件/符号链接(不入库) ----
+.tmp-*
+/bin
+/config

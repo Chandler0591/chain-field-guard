@@ -70,6 +70,22 @@ export async function counterSign(batchId) {
   return request('post', `/batches/${encodeURIComponent(batchId)}/countersign`);
 }
 
+/** 核对驳回:核对人附原因驳回(checker),状态 ANCHORED → REJECTED */
+export async function rejectCounterSign(batchId, reason) {
+  return request('post', `/batches/${encodeURIComponent(batchId)}/countersign-reject`, {
+    reason,
+  });
+}
+
+/** 整改重提:录入人上传整改版重新提交(operator),状态 REJECTED → ANCHORED */
+export async function resubmitBatch(batchId, newCid, newSha256, reason) {
+  return request('post', `/batches/${encodeURIComponent(batchId)}/resubmit`, {
+    newCid,
+    newSha256,
+    reason,
+  });
+}
+
 /** AI 预检:提交结构化检测数据,链下分析 + 结论哈希上链存证(operator) */
 export async function aiCheck(batchId, sample) {
   return request('post', `/batches/${encodeURIComponent(batchId)}/ai-check`, sample);
@@ -128,7 +144,11 @@ export async function verifyBatch(batchId, sha256) {
   return result;
 }
 
-/** 构造 IPFS 文件访问地址(预览/下载;后端按 CID 从 IPFS 取回) */
-export function ipfsUrl(cid) {
-  return `/api/ipfs/${encodeURIComponent(cid)}?role=${encodeURIComponent(roleStore.role)}`;
+/** 构造 IPFS 文件访问地址(预览/下载;后端按 CID 从 IPFS 取回)。
+ * 可选 filename:附带时后端设置 Content-Disposition,.json 报告可直接在
+ * 浏览器新标签页以文本展示(否则按 octet-stream 下载)。 */
+export function ipfsUrl(cid, filename) {
+  const params = new URLSearchParams({ role: roleStore.role });
+  if (filename) params.set('filename', filename);
+  return `/api/ipfs/${encodeURIComponent(cid)}?${params.toString()}`;
 }

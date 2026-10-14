@@ -2,19 +2,30 @@
   核对签名页(核对人 checker):
     1. 输入批次号查询批次详情与当前生效版本(CID/SHA-256);
     2. 可点击链接从 IPFS 取回文件核对内容;
-    3. 确认无误后点击"核对签名" —— 后端用核对人钱包私钥对数据包
-       batchId|cid|clientTimestamp 签名,链码用核对人证书公钥验签并记录,
-       批次状态 ANCHORED → COUNTER_SIGNED(不可抵赖)。
+    3. 依据 AI 风险提示人工复核:
+       - 确认无误 → 点击"核对签名",后端用核对人钱包私钥对数据包签名,
+         链码验签后批次状态 ANCHORED → COUNTER_SIGNED(不可抵赖);
+       - 认定不合格 → 填写驳回原因点击"核对驳回",链码验签后状态
+         ANCHORED → REJECTED(驳回历史链上留痕),录入人整改后可重新提交。
   =========================================================================== -->
 
 <script setup>
 import { ref } from 'vue';
 import { ElMessage } from 'element-plus';
-import { getBatch, counterSign, ipfsUrl } from '../api/index.js';
+import { getBatch, counterSign, rejectCounterSign, ipfsUrl } from '../api/index.js';
 
 const batchId = ref(''); // 查询批次号
 const batch = ref(null); // 查询到的批次详情
 const signing = ref(false); // 签名提交中标记
+const rejecting = ref(false); // 驳回提交中标记
+const rejectReason = ref(''); // 驳回原因(必填,链上留痕)
+
+/** 状态 → 标签样式:REJECTED 红色、ANCHORED/PENDING 黄色、其余绿色 */
+function statusTagType(status) {
+  if (status === 'REJECTED') return 'danger';
+  if (status === 'ANCHORED' || status === 'PENDING') return 'warning';
+  return 'success';
+}
 
 /** 查询批次详情(核对人可查询) */
 async function doQuery() {
@@ -43,6 +54,25 @@ async function doCounterSign() {
     signing.value = false;
   }
 }
+
+/** 核对驳回:附原因 + 后端签名 + 链上验签(ANCHORED → REJECTED) */
+async function doReject() {
+  if (!rejectReason.value.trim()) {
+    ElMessage.warning('请填写驳回原因(如:农残超标,退回整改)');
+    return;
+  }
+  rejecting.value = true;
+  try {
+    const updated = await rejectCounterSign(batch.value.batchId, rejectReason.value.trim());
+    batch.value = updated;
+    rejectReason.value = '';
+    ElMessage.success(`已驳回核对,状态:${updated.status},驳回原因已链上留痕`);
+  } catch (err) {
+    ElMessage.error(err.message);
+  } finally {
+    rejecting.value = false;
+  }
+}
 </script>
 
 <template>
@@ -68,7 +98,7 @@ async function doCounterSign() {
         <el-descriptions :column="2" border size="small" class="batch-desc">
           <el-descriptions-item label="批次号">{{ batch.batchId }}</el-descriptions-item>
           <el-descriptions-item label="状态">
-            <el-tag :type="batch.status === 'ANCHORED' ? 'warning' : 'success'">
+            <el-tag :type="statusTagType(batch.status)">
               {{ batch.status }}
             </el-tag>
           </el-descriptions-item>
@@ -105,6 +135,22 @@ async function doCounterSign() {
           </template>
         </el-alert>
 
+        <!-- 驳回历史(批次曾被核对驳回) -->
+        <el-alert
+          v-if="batch.rejections && batch.rejections.length"
+          type="error"
+          show-icon
+          :closable="false"
+          class="ai-alert"
+        >
+          <template #title>
+            <b>驳回历史(共 {{ batch.rejections.length }} 次,整改重提后保留可查):</b>
+          </template>
+          <div v-for="(r, i) in batch.rejections" :key="i" class="reject-item">
+            第 {{ i + 1 }} 次:{{ r.reason }}({{ r.rejectedBy }} · {{ r.rejectedAt }})
+          </div>
+        </el-alert>
+
         <!-- 核对操作区 -->
         <div class="action-row">
           <el-button @click="doQuery">刷新状态</el-button>
@@ -116,18 +162,35 @@ async function doCounterSign() {
           >
             从 IPFS 取回文件核对
           </el-link>
-          <el-button
-            v-if="batch.status === 'ANCHORED'"
-            type="success"
-            :loading="signing"
-            @click="doCounterSign"
-          >
-            核对签名(CounterSign)
-          </el-button>
+          <template v-if="batch.status === 'ANCHORED'">
+            <el-button
+              type="success"
+              :loading="signing"
+              @click="doCounterSign"
+            >
+              核对签名(CounterSign)
+            </el-button>
+            <el-input
+              v-model="rejectReason"
+              placeholder="驳回原因(如:农残超标,退回整改)"
+              class="reject-input"
+            />
+            <el-button
+              type="danger"
+              plain
+              :loading="rejecting"
+              @click="doReject"
+            >
+              核对驳回(RejectCounterSign)
+            </el-button>
+          </template>
           <el-tag v-else-if="batch.status === 'COUNTER_SIGNED'" type="success">
             已核对签名,可发起修改或由审核人锁定
           </el-tag>
-          <el-tag v-else type="info">当前状态 {{ batch.status }} 不支持核对签名</el-tag>
+          <el-tag v-else-if="batch.status === 'REJECTED'" type="danger">
+            已驳回,等待录入人整改后重新提交
+          </el-tag>
+          <el-tag v-else type="info">当前状态 {{ batch.status }} 不支持核对操作</el-tag>
         </div>
       </template>
 
@@ -149,10 +212,18 @@ async function doCounterSign() {
 .ai-alert {
   margin-bottom: 16px;
 }
+.reject-item {
+  font-size: 12px;
+  line-height: 1.8;
+}
+.reject-input {
+  width: 300px;
+}
 .action-row {
   display: flex;
   align-items: center;
   gap: 16px;
   margin-top: 16px;
+  flex-wrap: wrap;
 }
 </style>

@@ -1,10 +1,12 @@
 // =============================================================================
-// 批次业务路由:与链码 agrichain 的 10 个函数一一对应。
+// 批次业务路由:与链码 agrichain 的 12 个函数一一对应。
 //
 // 状态机流转(链码侧强制校验,后端只是转发):
 //   AnchorData(operator)      INIT → ANCHORED
-//   RecordAICheck(operator)   ANCHORED →(状态不变,AI 预检存证)
+//   RecordAICheck(operator)   ANCHORED →(状态不变,AI 预检存证;整改重提后可再次预检)
 //   CounterSign(checker)      ANCHORED → COUNTER_SIGNED(后端签名,链上验签)
+//   RejectCounterSign(ch)     ANCHORED → REJECTED(核对驳回,附原因)
+//   ResubmitData(operator)    REJECTED → ANCHORED(录入人整改后重新提交)
 //   RequestModification(op/ch)COUNTER_SIGNED → PENDING
 //   ApproveModification(au)   PENDING → COUNTER_SIGNED(批准=追加新版本)
 //   FinalizeBatch(auditor)    COUNTER_SIGNED → FINALIZED(颁发凭证,锁定)
@@ -26,15 +28,19 @@ const router = Router();
 /**
  * 包装异步路由处理:Express 4 不会自动捕获 async 抛出的异常,
  * 统一在此转成 JSON 错误响应,并把链码错误信息提取成可读文案。
+ * @param {Function} handler 异步路由处理器
+ * @param {(message:string)=>number} [statusOf] 自定义状态码映射(默认:含"不存在"→404,其余 500)
  */
-function wrap(handler) {
+function wrap(handler, statusOf) {
   return async (req, res, next) => {
     try {
       await handler(req, res, next);
     } catch (err) {
       const message = gateway.extractError(err);
-      // 链码报告批次不存在时映射为 404,其余按 500 返回
-      const status = message.includes('不存在') ? 404 : 500;
+      // 链码报告批次不存在时映射为 404,其余按 500 返回(可自定义映射)
+      const status = statusOf
+        ? statusOf(message)
+        : (message.includes('不存在') ? 404 : 500);
       res.status(status).json({ ok: false, error: message });
     }
   };
@@ -109,7 +115,7 @@ router.post(
       }
     }
 
-    // 2. 前置状态检查:仅 ANCHORED(锚定之后、核对签名之前)且未预检过
+    // 2. 前置状态检查:仅 ANCHORED(锚定之后、核对签名之前)
     const batch = await gateway.evaluateTx(req.role, 'GetBatch', id);
     if (batch.status !== 'ANCHORED') {
       return res.status(409).json({
@@ -117,9 +123,8 @@ router.post(
         error: `批次 ${id} 当前状态为 ${batch.status},仅 ANCHORED 状态可执行 AI 预检`,
       });
     }
-    if (batch.aiCheck) {
-      return res.status(409).json({ ok: false, error: `批次 ${id} 已完成 AI 预检,不允许重复执行` });
-    }
+    // 整改重提后(REJECTED → ANCHORED)允许再次预检:链码会把旧结论归档到
+    // aiChecks 保留(证据不覆盖),本接口不做拦截。
 
     // 3. 链下 AI 分析(可插拔引擎:AI_PROVIDER=rule 内置规则引擎 | http 外部模型
     //    服务;http 模式服务不可用时自动降级回退规则引擎,结果带 degradedFrom)
@@ -211,17 +216,86 @@ router.post(
       });
     }
 
-    // 2. 对当前生效版本签名(签名对象 = batchId|cid|clientTimestamp)
+    // 2. 对当前生效版本签名(签名对象 = SIGN|batchId|cid|clientTimestamp)
     const cid = currentVersionOf(batch).cid;
     const clientTimestamp = signer.currentTimestampSeconds();
     const privateKey = gateway.getRolePrivateKey(req.role);
-    const signature = signer.signPayload(privateKey, id, cid, clientTimestamp);
+    const signature = signer.signPayload(
+      privateKey, signer.SIGN_KIND_COUNTER_SIGN, id, cid, clientTimestamp
+    );
 
     // 3. 签名 + 时间戳随交易上链,链码验签通过后状态推进为 COUNTER_SIGNED
     const updated = await gateway.submitTx(
       req.role, 'CounterSign', id, signature, String(clientTimestamp)
     );
     return ok(res, updated);
+  })
+);
+
+// =============================================================================
+// 写接口:核对驳回 + 整改重提
+// =============================================================================
+
+/**
+ * POST /api/batches/:id/countersign-reject —— 核对驳回(核对人)
+ * 请求体:{ reason } —— 核对人依据 AI 风险提示与人工复核认定不合格,
+ * 后端用核对人私钥签名(REJECT 用途)并附驳回原因上链,状态 ANCHORED → REJECTED。
+ * 驳回后录入人可整改重新提交(POST /batches/:id/resubmit),重新走核对流程。
+ */
+router.post(
+  '/batches/:id/countersign-reject',
+  requireRole('checker'),
+  wrap(async (req, res) => {
+    const { id } = req.params;
+    const reason = req.body?.reason;
+    if (!reason || !String(reason).trim()) {
+      return res.status(400).json({ ok: false, error: '驳回原因(reason)为必填,链上需留痕' });
+    }
+
+    // 1. 读取批次当前状态(仅 ANCHORED 可驳回)
+    const batch = await gateway.evaluateTx(req.role, 'GetBatch', id);
+    if (batch.status !== 'ANCHORED') {
+      return res.status(409).json({
+        ok: false,
+        error: `批次 ${id} 当前状态为 ${batch.status},仅 ANCHORED 状态可核对驳回`,
+      });
+    }
+
+    // 2. 对当前生效版本签名(签名对象 = REJECT|batchId|cid|clientTimestamp)
+    const cid = currentVersionOf(batch).cid;
+    const clientTimestamp = signer.currentTimestampSeconds();
+    const privateKey = gateway.getRolePrivateKey(req.role);
+    const signature = signer.signPayload(
+      privateKey, signer.SIGN_KIND_REJECT, id, cid, clientTimestamp
+    );
+
+    // 3. 驳回签名 + 原因 + 时间戳随交易上链,链码验签后状态推进为 REJECTED
+    const updated = await gateway.submitTx(
+      req.role, 'RejectCounterSign', id, String(reason).trim(), signature, String(clientTimestamp)
+    );
+    return ok(res, updated);
+  })
+);
+
+/**
+ * POST /api/batches/:id/resubmit —— 整改重提(录入人)
+ * 请求体:{ newCid, newSha256, reason? } —— 驳回后录入人上传整改版文件重新提交,
+ * 链码把新版本追加为 currentVersion+1(旧版本 DEPRECATED)、状态回 ANCHORED,
+ * 之后可重新 AI 预检、重新核对签名。reason 为整改说明(可选,审计留痕)。
+ */
+router.post(
+  '/batches/:id/resubmit',
+  requireRole('operator'),
+  wrap(async (req, res) => {
+    const { id } = req.params;
+    const { newCid, newSha256, reason } = req.body ?? {};
+    if (!newCid || !newSha256) {
+      return res.status(400).json({ ok: false, error: 'newCid、newSha256 为必填' });
+    }
+    const batch = await gateway.submitTx(
+      req.role, 'ResubmitData', id, newCid, newSha256, reason ?? ''
+    );
+    return ok(res, batch);
   })
 );
 
@@ -321,6 +395,7 @@ router.get(
 /**
  * POST /api/verify/:id —— 消费者验证(任意角色,含监管方)
  * 请求体:{ sha256 } —— 链码把外部哈希与链上当前版本哈希比对,返回 MATCH/MISMATCH。
+ * 仅 FINALIZED(已签发凭证)的批次可对外验证;未签发/被驳回的批次由链码拒绝。
  */
 router.post(
   '/verify/:id',
@@ -332,7 +407,7 @@ router.post(
     }
     const result = await gateway.evaluateRaw(req.role, 'VerifyBatch', req.params.id, sha256);
     return ok(res, { result });
-  })
+  }, (message) => (message.includes('不存在') ? 404 : 400))
 );
 
 export default router;

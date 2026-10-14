@@ -3,12 +3,16 @@ package agrichain
 // =============================================================================
 // 链田守护(ChainField Guard)智能合约
 //
-// 实现批次状态机:INIT → ANCHORED → COUNTER_SIGNED ⇄ PENDING → FINALIZED
+// 实现批次状态机:
+//   INIT → ANCHORED → COUNTER_SIGNED ⇄ PENDING → FINALIZED
+//   ANCHORED → REJECTED → ANCHORED(核对不通过:驳回 → 录入人整改重提 → 重新核对)
 //
 //   写操作(角色 + 状态双重校验):
 //     AnchorData          operator        INIT            → ANCHORED
 //     RecordAICheck       operator        ANCHORED        → (状态不变,AI 预检存证)
 //     CounterSign         checker         ANCHORED        → COUNTER_SIGNED(链上验签)
+//     RejectCounterSign   checker         ANCHORED        → REJECTED(链上验签,附驳回原因)
+//     ResubmitData        operator        REJECTED        → ANCHORED(整改后追加新版本重提)
 //     RequestModification operator/checker COUNTER_SIGNED → PENDING
 //     ApproveModification auditor         PENDING         → COUNTER_SIGNED(批准则追加版本)
 //     FinalizeBatch       auditor         COUNTER_SIGNED  → FINALIZED(颁发数字凭证)
@@ -101,7 +105,7 @@ func (s *SmartContract) AnchorData(ctx contractapi.TransactionContextInterface, 
 // 证书公钥在链上验签,验签通过后批次状态 ANCHORED → COUNTER_SIGNED。
 //
 //	参数:batchId 批次号;signature 核对人签名(hex 编码的 ECDSA P-256 ASN.1 签名,
-//	     签名对象为 batchId|当前CID|clientTimestamp,见 signPayload);
+//	     签名对象为 SIGN|batchId|当前CID|clientTimestamp,见 signPayload);
 //	     clientTimestamp 核对人签名时本机 Unix 秒 —— 链码校验其与链上交易时间戳
 //	     的偏差不超过 TimestampToleranceSeconds,既容忍跨秒又防旧签名重放。
 //
@@ -143,12 +147,130 @@ func (s *SmartContract) CounterSign(ctx contractapi.TransactionContextInterface,
 			clientTimestamp, ts.GetSeconds(), TimestampToleranceSeconds)
 	}
 	// 重建签名数据包并用调用者证书公钥验证(签名不可抵赖、数据不可篡改)
-	payload := signPayload(batchId, ver.Cid, clientTimestamp)
+	payload := signPayload(SignKindCounterSign, batchId, ver.Cid, clientTimestamp)
 	if err := verifySignature(ctx, payload, signature); err != nil {
 		return nil, fmt.Errorf("链上验签失败:%w", err)
 	}
 	batch.Status = StatusCounterSigned
 	batch.Signatures = append(batch.Signatures, signature)
+	if err := putBatch(ctx, batch); err != nil {
+		return nil, err
+	}
+	return batch, nil
+}
+
+// RejectCounterSign 核对驳回(核对人):核对人认定数据不合格(通常依据 AI 预检
+// 风险提示与人工复核)时,对数据包签名并附驳回原因,批次状态 ANCHORED → REJECTED。
+// 驳回历史追加到 Rejections(不覆盖),录入人可据此整改并重新提交(ResubmitData)。
+//
+//	参数:batchId;reason 驳回原因(必填,链上留痕);signature 核对人签名(hex),
+//	     签名对象为 REJECT|batchId|当前CID|clientTimestamp(与 CounterSign 的
+//	     数据包仅 kind 不同,防跨用途重放);clientTimestamp 签名时本机 Unix 秒。
+func (s *SmartContract) RejectCounterSign(ctx contractapi.TransactionContextInterface, batchId string, reason string, signature string, clientTimestamp int64) (*ProductBatch, error) {
+	if err := rejectRegulatorWrite(ctx); err != nil {
+		return nil, err
+	}
+	if err := requireRole(ctx, RoleChecker); err != nil {
+		return nil, err
+	}
+	if reason == "" {
+		return nil, fmt.Errorf("reason(驳回原因)不能为空,链上需留痕")
+	}
+	if signature == "" {
+		return nil, fmt.Errorf("signature 不能为空")
+	}
+	batch, err := mustGetBatch(ctx, batchId)
+	if err != nil {
+		return nil, err
+	}
+	// 状态机:仅 ANCHORED 状态允许核对驳回
+	if batch.Status != StatusAnchored {
+		return nil, fmt.Errorf("批次 %s 当前状态为 %s,仅 %s 状态可核对驳回", batchId, batch.Status, StatusAnchored)
+	}
+	ver, err := currentVersion(batch)
+	if err != nil {
+		return nil, err
+	}
+	// 容差校验:驳回签名时间戳与链上交易时间偏差过大则拒绝(防重放)
+	ts, err := ctx.GetStub().GetTxTimestamp()
+	if err != nil {
+		return nil, fmt.Errorf("读取交易时间戳失败: %w", err)
+	}
+	diff := ts.GetSeconds() - clientTimestamp
+	if diff < 0 {
+		diff = -diff
+	}
+	if diff > TimestampToleranceSeconds {
+		return nil, fmt.Errorf("签名时间戳 %d 与链上交易时间 %d 偏差超过 %d 秒,签名无效",
+			clientTimestamp, ts.GetSeconds(), TimestampToleranceSeconds)
+	}
+	// 重建驳回签名数据包并验签(驳回同样不可抵赖、不可篡改)
+	payload := signPayload(SignKindReject, batchId, ver.Cid, clientTimestamp)
+	if err := verifySignature(ctx, payload, signature); err != nil {
+		return nil, fmt.Errorf("链上验签失败:%w", err)
+	}
+	callerID, err := ctx.GetClientIdentity().GetID()
+	if err != nil {
+		return nil, fmt.Errorf("读取调用者身份 ID 失败: %w", err)
+	}
+	batch.Rejections = append(batch.Rejections, &Rejection{
+		Reason:     reason,
+		RejectedBy: callerID,
+		RejectedAt: ts.AsTime().Format(time.RFC3339),
+	})
+	batch.Status = StatusRejected
+	if err := putBatch(ctx, batch); err != nil {
+		return nil, err
+	}
+	return batch, nil
+}
+
+// ResubmitData 整改重提(录入人):核对驳回后,录入人上传整改修订版文件并
+// 重新提交,批次状态 REJECTED → ANCHORED,重新进入核对环节(可再次 AI 预检、
+// 再次核对签名/驳回)。新版本照旧追加,旧版本标记 DEPRECATED;驳回历史保留。
+//
+//	参数:batchId;newCid 整改版文件 CID;newSha256 整改版哈希;reason 整改说明(可选)
+func (s *SmartContract) ResubmitData(ctx contractapi.TransactionContextInterface, batchId string, newCid string, newSha256 string, reason string) (*ProductBatch, error) {
+	if err := rejectRegulatorWrite(ctx); err != nil {
+		return nil, err
+	}
+	if err := requireRole(ctx, RoleOperator); err != nil {
+		return nil, err
+	}
+	if newCid == "" || newSha256 == "" {
+		return nil, fmt.Errorf("newCid 与 newSha256 均不能为空")
+	}
+	batch, err := mustGetBatch(ctx, batchId)
+	if err != nil {
+		return nil, err
+	}
+	// 状态机:仅 REJECTED 状态允许整改重提
+	if batch.Status != StatusRejected {
+		return nil, fmt.Errorf("批次 %s 当前状态为 %s,仅 %s 状态可整改重提", batchId, batch.Status, StatusRejected)
+	}
+	callerID, err := ctx.GetClientIdentity().GetID()
+	if err != nil {
+		return nil, fmt.Errorf("读取调用者身份 ID 失败: %w", err)
+	}
+	ts, err := ctx.GetStub().GetTxTimestamp()
+	if err != nil {
+		return nil, fmt.Errorf("读取交易时间戳失败: %w", err)
+	}
+	// 追加式重提:旧版本归档,整改版追加为当前版本(与批准修改同一追加语义)
+	for i := range batch.Versions {
+		batch.Versions[i].Status = VersionDeprecated
+	}
+	batch.Versions = append(batch.Versions, BatchVersion{
+		Version:    batch.CurrentVersion + 1,
+		Cid:        newCid,
+		Sha256:     newSha256,
+		AnchoredBy: callerID,
+		AnchoredAt: ts.AsTime().Format(time.RFC3339),
+		Status:     VersionActive,
+		Reason:     reason,
+	})
+	batch.CurrentVersion++
+	batch.Status = StatusAnchored
 	if err := putBatch(ctx, batch); err != nil {
 		return nil, err
 	}
@@ -291,9 +413,11 @@ func (s *SmartContract) FinalizeBatch(ctx contractapi.TransactionContextInterfac
 //   - 链上存证:AI 结论作为独立证据存证,不覆盖任何业务数据,监管方可依据
 //     reportHash 追溯 AI 何时(checkedAt)基于何数据做出何判断;
 //   - 人工决策:本函数不改变批次状态机,核对人签名前可查看风险提示,
-//     自行决定继续签名或发起修改 —— 最终决策权在人工与链上规则。
+//     自行决定继续签名或驳回 —— 最终决策权在人工与链上规则。
 //
-// 约束:仅 ANCHORED 状态可预检(锚定之后、核对签名之前),每批次仅一次。
+// 约束:仅 ANCHORED 状态可预检(锚定之后、核对签名之前);整改重提后
+// (REJECTED → ANCHORED)允许对整改版再次预检,旧结论归档到 AIChecks 保留,
+// 证据永不覆盖、全程可追溯。
 //
 //	参数:batchId;reportCid AI 报告 IPFS CID;reportHash AI 报告 SHA-256;
 //	     riskScore 风险评分(0-100,链码校验范围并派生 riskLevel);
@@ -320,9 +444,9 @@ func (s *SmartContract) RecordAICheck(ctx contractapi.TransactionContextInterfac
 	if batch.Status != StatusAnchored {
 		return nil, fmt.Errorf("批次 %s 当前状态为 %s,仅 %s 状态可执行 AI 预检", batchId, batch.Status, StatusAnchored)
 	}
-	// 每批次仅允许一次预检(结论是证据,不允许覆盖)
+	// 整改重提后再次预检:旧结论归档到 AIChecks 保留(证据不覆盖)
 	if batch.AICheck != nil {
-		return nil, fmt.Errorf("批次 %s 已完成 AI 预检,不允许重复执行", batchId)
+		batch.AIChecks = append(batch.AIChecks, batch.AICheck)
 	}
 	callerID, err := ctx.GetClientIdentity().GetID()
 	if err != nil {
@@ -368,6 +492,8 @@ func (s *SmartContract) GetAllVersions(ctx contractapi.TransactionContextInterfa
 
 // VerifyBatch 验证批次数据哈希:将外部提供的 SHA-256 与链上当前生效版本的
 // 哈希比对,返回 "MATCH" 或 "MISMATCH"。消费者/监管方可借此核验文件未被篡改。
+// 仅 FINALIZED(已签发凭证)的批次可对外验证 —— 未签发/被驳回的批次不对外
+// 提供验证结论,避免"不合格数据也能验证通过"的业务歧义。
 func (s *SmartContract) VerifyBatch(ctx contractapi.TransactionContextInterface, batchId string, sha256 string) (string, error) {
 	if sha256 == "" {
 		return "", fmt.Errorf("sha256 不能为空")
@@ -375,6 +501,15 @@ func (s *SmartContract) VerifyBatch(ctx contractapi.TransactionContextInterface,
 	batch, err := mustGetBatch(ctx, batchId)
 	if err != nil {
 		return "", err
+	}
+	// 状态检查:仅已签发凭证的批次可对外验证
+	switch batch.Status {
+	case StatusFinalized:
+		// 正常走哈希比对
+	case StatusRejected:
+		return "", fmt.Errorf("批次 %s 核对未通过(已驳回),未签发数字凭证,不可对外验证", batchId)
+	default:
+		return "", fmt.Errorf("批次 %s 尚未锁定签发(当前状态 %s),暂不可对外验证", batchId, batch.Status)
 	}
 	ver, err := currentVersion(batch)
 	if err != nil {

@@ -10,11 +10,16 @@ package agrichain
 // =============================================================================
 
 // ---------------------------------------------------------------------------
-// 批次状态机:INIT → ANCHORED → COUNTER_SIGNED ⇄ PENDING → FINALIZED
+// 批次状态机:
+//
+//	INIT → ANCHORED → COUNTER_SIGNED ⇄ PENDING → FINALIZED
+//	ANCHORED → REJECTED → ANCHORED(核对不通过:驳回 → 录入人整改重提 → 重新核对)
+//
 // ---------------------------------------------------------------------------
 const (
 	StatusInit          = "INIT"           // 初始状态(批次未上链时逻辑上的状态)
-	StatusAnchored      = "ANCHORED"       // 已锚定:录入人写入首个数据版本
+	StatusAnchored      = "ANCHORED"       // 已锚定:录入人写入数据版本,等待核对
+	StatusRejected      = "REJECTED"       // 已驳回:核对人不通过(附原因),退回录入人整改
 	StatusCounterSigned = "COUNTER_SIGNED" // 已核对:核对人签名通过
 	StatusPending       = "PENDING"        // 修改待审核:已发起追加式修改请求
 	StatusFinalized     = "FINALIZED"      // 已锁定:批次锁定并颁发数字凭证,拒绝一切写入
@@ -47,20 +52,30 @@ const (
 const TimestampToleranceSeconds = 600
 
 // 风险等级(由风险分派生,链上唯一权威;AI 预检存证使用):
-//   0-29 NORMAL(正常)/ 30-59 WARN(关注)/ 60-100 HIGH(高风险)
+//
+//	0-29 NORMAL(正常)/ 30-59 WARN(关注)/ 60-100 HIGH(高风险)
 const (
 	RiskLevelNormal = "NORMAL"
 	RiskLevelWarn   = "WARN"
 	RiskLevelHigh   = "HIGH"
 )
 
-// SignPayloadFormat 定义核对人签名数据包的拼接规则(前后端约定一致,不可随意改动):
-//   <batchId>|<当前版本CID>|<客户端签名时间戳(Unix 秒)>
+// SignPayloadFormat 定义签名数据包的拼接规则(前后端约定一致,不可随意改动):
+//
+//	<签名用途kind>|<batchId>|<当前版本CID>|<客户端签名时间戳(Unix 秒)>
+//
+// kind 区分签名用途(签名通过 SIGN / 驳回 REJECT),防止同一签名被跨用途重放;
 // 后端(node:crypto)与链码必须按同一规则重建数据包,否则链上验签失败。
 // 时间戳由后端在签名时刻取本机 Unix 秒(随交易作为参数上链),链码校验其与
 // 链上交易时间戳(stub.GetTxTimestamp)的偏差在容差内 —— 既避免客户端无法
 // 预知链上时间戳的跨秒问题,又防止旧签名重放。
-const SignPayloadFormat = "%s|%s|%d"
+const SignPayloadFormat = "%s|%s|%s|%d"
+
+// 签名用途(kind)常量:写入签名数据包首位,链上按用途重建数据包验签。
+const (
+	SignKindCounterSign = "SIGN"   // 核对签名通过(CounterSign)
+	SignKindReject      = "REJECT" // 核对驳回(RejectCounterSign)
+)
 
 // ---------------------------------------------------------------------------
 // 链上数据结构
@@ -68,12 +83,13 @@ const SignPayloadFormat = "%s|%s|%d"
 
 // BatchVersion 表示批次的一个数据版本(追加式存储,永不覆盖)。
 type BatchVersion struct {
-	Version    int    `json:"version"`    // 版本号,从 1 递增
-	Cid        string `json:"cid"`        // 文件在 IPFS 上的内容标识符
-	Sha256     string `json:"sha256"`     // 文件内容的 SHA-256 哈希(链上存哈希,不存原文)
-	AnchoredBy string `json:"anchoredBy"` // 该版本由哪个身份(证书主体)写入
-	AnchoredAt string `json:"anchoredAt"` // 写入时间(RFC3339,取自链码交易时间戳)
-	Status     string `json:"status"`     // ACTIVE(当前生效)/ DEPRECATED(历史归档)
+	Version    int    `json:"version"`                               // 版本号,从 1 递增
+	Cid        string `json:"cid"`                                   // 文件在 IPFS 上的内容标识符
+	Sha256     string `json:"sha256"`                                // 文件内容的 SHA-256 哈希(链上存哈希,不存原文)
+	AnchoredBy string `json:"anchoredBy"`                            // 该版本由哪个身份(证书主体)写入
+	AnchoredAt string `json:"anchoredAt"`                            // 写入时间(RFC3339,取自链码交易时间戳)
+	Status     string `json:"status"`                                // ACTIVE(当前生效)/ DEPRECATED(历史归档)
+	Reason     string `json:"reason,omitempty" metadata:",optional"` // 整改说明(驳回后重新提交时填写,审计留痕)
 }
 
 // PendingModification 表示一笔待审核的追加式修改请求。
@@ -82,6 +98,15 @@ type PendingModification struct {
 	NewSha256   string `json:"newSha256"`   // 新版本文件哈希
 	Reason      string `json:"reason"`      // 修改原因(审计留痕)
 	RequestedBy string `json:"requestedBy"` // 发起人(证书主体)
+}
+
+// Rejection 表示一次核对驳回(核对人对数据不合格的正式结论)。
+// 驳回历史全部保留(Rejections 数组),录入人整改重提后也不删除,
+// 保证"核对不通过 → 整改 → 重新核对"全程可审计。
+type Rejection struct {
+	Reason     string `json:"reason"`     // 驳回原因(如"农残超标,退回整改")
+	RejectedBy string `json:"rejectedBy"` // 驳回的核对人(证书主体)
+	RejectedAt string `json:"rejectedAt"` // 驳回时间(RFC3339,链码交易时间戳)
 }
 
 // AICheck 表示一次 AI 预检的链上存证(链下 AI 分析、链上锚定摘要与哈希)。
@@ -104,12 +129,14 @@ type AICheck struct {
 
 // ProductBatch 表示一个农产品检验批次,以 batchId 为唯一键存在链上。
 type ProductBatch struct {
-	BatchId             string               `json:"batchId"`             // 批次号(业务主键,链上状态键)
-	Status              string               `json:"status"`              // 批次状态机当前状态
-	Versions            []BatchVersion       `json:"versions"`            // 全部数据版本(追加式,含历史 DEPRECATED 版本)
-	CurrentVersion      int                  `json:"currentVersion"`      // 当前生效版本号
-	Signatures          []string             `json:"signatures"`          // 核对人签名(hex 编码的 ECDSA ASN.1 签名)
-	PendingModification *PendingModification `json:"pendingModification"` // 待审核修改请求(nil 表示无)
-	CredentialId        string               `json:"credentialId"`        // 数字凭证 ID(锁定后生成,格式 VC-<batchId>-<txId>)
-	AICheck             *AICheck             `json:"aiCheck"`             // AI 预检存证(nil=未预检;锚定后、核对签名前写入)
+	BatchId             string               `json:"batchId"`                                   // 批次号(业务主键,链上状态键)
+	Status              string               `json:"status"`                                    // 批次状态机当前状态
+	Versions            []BatchVersion       `json:"versions"`                                  // 全部数据版本(追加式,含历史 DEPRECATED 版本)
+	CurrentVersion      int                  `json:"currentVersion"`                            // 当前生效版本号
+	Signatures          []string             `json:"signatures"`                                // 核对人签名(hex 编码的 ECDSA ASN.1 签名)
+	PendingModification *PendingModification `json:"pendingModification"`                       // 待审核修改请求(nil 表示无)
+	CredentialId        string               `json:"credentialId"`                              // 数字凭证 ID(锁定后生成,格式 VC-<batchId>-<txId>)
+	AICheck             *AICheck             `json:"aiCheck"`                                   // 最新一次 AI 预检存证(nil=未预检;仅 ANCHORED 状态可写入)
+	AIChecks            []*AICheck           `json:"aiChecks,omitempty" metadata:",optional"`   // 历史预检归档(整改重提后再次预检,旧结论归档于此,证据不覆盖)
+	Rejections          []*Rejection         `json:"rejections,omitempty" metadata:",optional"` // 核对驳回历史(整改重提后保留,全程可审计)
 }

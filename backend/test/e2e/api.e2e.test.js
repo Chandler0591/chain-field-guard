@@ -335,13 +335,13 @@ test('10 消费者验证:正确哈希 MATCH,篡改哈希 MISMATCH', { skip: !RUN
     role: 'regulator',
     body: { sha256: ctx.shaV2 }, // 当前生效版本是 v2
   });
-  assert.equal(okCase.result, 'MATCH');
+  assert.equal(okCase.data.result, 'MATCH');
 
   const badCase = await apiOk('POST', `/verify/${ctx.batchId}`, {
     role: 'regulator',
     body: { sha256: '0'.repeat(64) },
   });
-  assert.equal(badCase.result, 'MISMATCH');
+  assert.equal(badCase.data.result, 'MISMATCH');
 });
 
 // =============================================================================
@@ -401,4 +401,151 @@ test('12d 查询:不存在的批次返回 404', { skip: !RUN_E2E }, async () => 
   const { status, data } = await api('GET', '/batches/NO-SUCH-BATCH', { role: 'regulator' });
   assert.equal(status, 404);
   assert.match(data.error, /不存在/);
+});
+
+// =============================================================================
+// 用例 13:驳回-整改-重签-签发-验证完整闭环(独立批次,不干扰主流程)
+//   ANCHORED → (AI HIGH) → 核对驳回 REJECTED → 整改重提 ANCHORED v2 →
+//   (重新预检 NORMAL,旧结论归档) → 重新核对签名 COUNTER_SIGNED →
+//   锁定发证 FINALIZED → 消费者验证整改版 MATCH / 旧版 MISMATCH。
+//   关键验证:① 驳回后不可验证(未签发);② 驳回原因/旧 AI 结论链上留痕;
+//   ③ 整改后能正常走到合格签发,证明驳回不是死路。
+// =============================================================================
+const ctxRJ = {
+  batchId: null, // 独立批次号(13a 初始化)
+  cidV1: null, // 首版(被驳回)文件 CID
+  shaV1: null,
+  cidV2: null, // 整改版文件 CID
+  shaV2: null,
+};
+
+test('13a 驳回准备:锚定 + AI 预检 HIGH(农残严重超标)', { skip: !RUN_E2E }, async () => {
+  ctxRJ.batchId = `${ctx.batchId}-RJ`;
+  const uploaded = await uploadFile(makeContent(5), `report-${ctxRJ.batchId}-v1.txt`);
+  ctxRJ.cidV1 = uploaded.cid;
+  ctxRJ.shaV1 = uploaded.sha256;
+
+  await apiOk('POST', '/batches', {
+    role: 'operator',
+    body: { batchId: ctxRJ.batchId, dataCid: ctxRJ.cidV1, sha256: ctxRJ.shaV1 },
+  });
+
+  const { data: batch } = await apiOk('POST', `/batches/${ctxRJ.batchId}/ai-check`, {
+    role: 'operator',
+    body: {
+      origin: '山东寿光',
+      produceType: '叶菜类',
+      pesticideResidue: 0.15, // 命中严重阈值 → 60 分 HIGH
+      heavyMetalPb: 0.02,
+      moisturePct: 9,
+    },
+  });
+  assert.equal(batch.status, 'ANCHORED');
+  assert.equal(batch.aiCheck.riskLevel, 'HIGH');
+});
+
+test('13b 核对驳回:checker 附原因驳回 → REJECTED,原因链上留痕', { skip: !RUN_E2E }, async () => {
+  const { data: batch } = await apiOk('POST', `/batches/${ctxRJ.batchId}/countersign-reject`, {
+    role: 'checker',
+    body: { reason: '农药残留严重超标(0.15 mg/kg),退回整改' },
+  });
+
+  assert.equal(batch.status, 'REJECTED');
+  assert.equal(batch.rejections.length, 1, '驳回历史应链上留痕');
+  assert.match(batch.rejections[0].reason, /农药残留严重超标/);
+  assert.ok(batch.rejections[0].rejectedBy, '驳回人身份 ID 应链上留痕');
+  assert.ok(batch.rejections[0].rejectedAt, '驳回时间应链上留痕');
+
+  // 驳回后消费者验证必须被拒:未签发数字凭证,不可对外验证(400)
+  const { status, data } = await api('POST', `/verify/${ctxRJ.batchId}`, {
+    role: 'regulator',
+    body: { sha256: ctxRJ.shaV1 },
+  });
+  assert.equal(status, 400);
+  assert.equal(data.ok, false);
+  assert.match(data.error, /未签发|不可对外验证/);
+});
+
+test('13b2 驳回边界:空原因被后端拒绝(400)', { skip: !RUN_E2E }, async () => {
+  // 批次已 REJECTED,此用例只验证参数校验(在提交链上前被拦下)
+  const { status, data } = await api('POST', `/batches/${ctxRJ.batchId}/countersign-reject`, {
+    role: 'checker',
+    body: { reason: '   ' },
+  });
+  assert.equal(status, 400);
+  assert.match(data.error, /必填/);
+});
+
+test('13c 整改重提:operator 上传整改版重提 → ANCHORED v2,旧版本 DEPRECATED', { skip: !RUN_E2E }, async () => {
+  const uploaded = await uploadFile(makeContent(6), `report-${ctxRJ.batchId}-v2.txt`);
+  ctxRJ.cidV2 = uploaded.cid;
+  ctxRJ.shaV2 = uploaded.sha256;
+
+  const { data: batch } = await apiOk('POST', `/batches/${ctxRJ.batchId}/resubmit`, {
+    role: 'operator',
+    body: {
+      newCid: ctxRJ.cidV2,
+      newSha256: ctxRJ.shaV2,
+      reason: '已复检整改:农残降至 0.001 mg/kg,附整改后检验报告',
+    },
+  });
+
+  assert.equal(batch.status, 'ANCHORED', '重提后回到 ANCHORED,重新走核对流程');
+  assert.equal(batch.currentVersion, 2);
+  assert.equal(batch.versions.length, 2, '重提是追加式,被驳回的旧版本必须保留');
+  assert.equal(batch.versions[0].status, 'DEPRECATED');
+  assert.equal(batch.versions[1].status, 'ACTIVE');
+  assert.equal(batch.versions[1].cid, ctxRJ.cidV2);
+  assert.match(batch.versions[1].reason ?? '', /已复检整改/, '整改说明应在新版本留痕');
+  // 驳回历史不被清空(证据链保留)
+  assert.equal(batch.rejections.length, 1);
+});
+
+test('13d 重新预检:整改版达标 → NORMAL,旧 HIGH 结论归档 aiChecks', { skip: !RUN_E2E }, async () => {
+  const { data: batch } = await apiOk('POST', `/batches/${ctxRJ.batchId}/ai-check`, {
+    role: 'operator',
+    body: {
+      origin: '山东寿光',
+      produceType: '叶菜类',
+      pesticideResidue: 0.001, // 整改后达标
+      heavyMetalPb: 0.01,
+      moisturePct: 9,
+    },
+  });
+
+  assert.equal(batch.status, 'ANCHORED', 'AI 结论不改变状态机');
+  assert.equal(batch.aiCheck.riskLevel, 'NORMAL', '整改后重新预检应合格');
+  assert.equal(batch.aiCheck.riskScore, 0);
+  assert.equal(batch.aiChecks.length, 1, '旧结论应归档到历史列表');
+  assert.equal(batch.aiChecks[0].riskLevel, 'HIGH', '归档的旧结论是驳回前的 HIGH');
+});
+
+test('13e 重新核对签名:整改版通过核对 → COUNTER_SIGNED', { skip: !RUN_E2E }, async () => {
+  const { data: batch } = await apiOk('POST', `/batches/${ctxRJ.batchId}/countersign`, {
+    role: 'checker',
+  });
+  assert.equal(batch.status, 'COUNTER_SIGNED');
+  assert.equal(batch.signatures.length, 1);
+});
+
+test('13f 锁定发证:驳回整改后的批次也能合格签发 → FINALIZED', { skip: !RUN_E2E }, async () => {
+  const { data: batch } = await apiOk('POST', `/batches/${ctxRJ.batchId}/finalize`, {
+    role: 'auditor',
+  });
+  assert.equal(batch.status, 'FINALIZED');
+  assert.match(batch.credentialId, new RegExp(`^VC-${ctxRJ.batchId}-`));
+});
+
+test('13g 消费者验证:整改版 MATCH,被驳回的旧版 MISMATCH', { skip: !RUN_E2E }, async () => {
+  const okCase = await apiOk('POST', `/verify/${ctxRJ.batchId}`, {
+    role: 'regulator',
+    body: { sha256: ctxRJ.shaV2 }, // 当前生效版本是整改版 v2
+  });
+  assert.equal(okCase.data.result, 'MATCH');
+
+  const badCase = await apiOk('POST', `/verify/${ctxRJ.batchId}`, {
+    role: 'regulator',
+    body: { sha256: ctxRJ.shaV1 }, // 被驳回的旧版不应对应签发凭证
+  });
+  assert.equal(badCase.data.result, 'MISMATCH');
 });

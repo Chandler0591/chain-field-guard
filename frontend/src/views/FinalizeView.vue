@@ -94,7 +94,7 @@ onMounted(() => {
         <el-descriptions :column="2" border size="small" class="batch-desc">
           <el-descriptions-item label="批次号">{{ batch.batchId }}</el-descriptions-item>
           <el-descriptions-item label="状态">
-            <el-tag :type="batch.status === 'FINALIZED' ? 'success' : 'warning'">
+            <el-tag :type="batch.status === 'FINALIZED' ? 'success' : batch.status === 'REJECTED' ? 'danger' : 'warning'">
               {{ batch.status }}
             </el-tag>
           </el-descriptions-item>
@@ -118,6 +118,9 @@ onMounted(() => {
           </el-button>
           <el-tag v-else-if="batch.status === 'FINALIZED'" type="success">
             已锁定,凭证已颁发,拒绝一切写入
+          </el-tag>
+          <el-tag v-else-if="batch.status === 'REJECTED'" type="danger">
+            批次已被核对驳回,待录入人整改重提后才能重新走核对流程
           </el-tag>
           <el-tag v-else type="info">
             状态 {{ batch.status }} 不可锁定(需 COUNTER_SIGNED 且无待审核修改)

@@ -210,12 +210,13 @@ func sampleBatch(batchId string, status string) *ProductBatch {
 // 签名(核对人侧,模拟后端 node:crypto 行为)
 // ---------------------------------------------------------------------------
 
-// signForBatch 用私钥对签名数据包 <batchId>|<cid>|<txSeconds> 做 SHA-256 后
+// signForBatch 用私钥对签名数据包 <kind>|<batchId>|<cid>|<txSeconds> 做 SHA-256 后
 // ECDSA P-256 签名(ASN.1 DER),hex 编码返回 —— 与后端签名、链码验签完全一致。
-// txSeconds 必须与 stub 交易时间戳一致(即 stub.TxTimestamp.GetSeconds())。
-func signForBatch(t *testing.T, key *ecdsa.PrivateKey, batchId, dataCid string, txSeconds int64) string {
+// kind 为签名用途(签名通过/驳回),txSeconds 必须与 stub 交易时间戳一致
+// (即 stub.TxTimestamp.GetSeconds())。
+func signForBatch(t *testing.T, key *ecdsa.PrivateKey, kind, batchId, dataCid string, txSeconds int64) string {
 	t.Helper()
-	payload := signPayload(batchId, dataCid, txSeconds)
+	payload := signPayload(kind, batchId, dataCid, txSeconds)
 	digest := sha256.Sum256(payload)
 	sig, err := ecdsa.SignASN1(rand.Reader, key, digest[:])
 	if err != nil {

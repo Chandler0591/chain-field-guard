@@ -1,13 +1,15 @@
 <!-- ===========================================================================
   AI 预检页(录入人 operator):
     1. 输入批次号查询批次状态;
-    2. 批次处于 ANCHORED(锚定之后、核对签名之前)且未预检时,填写结构化
-       检测数据(产地/产品类型 + 农残/铅/水分)触发链下 AI 分析;
+    2. 批次处于 ANCHORED(锚定之后、核对签名之前)时,填写结构化检测数据
+       (产地/产品类型 + 农残/铅/水分)触发链下 AI 分析;
     3. AI 结论(风险评分/等级/异常项/模型版本)哈希上链存证,页面展示结果;
-    4. 已预检的批次只读展示,监管方可核验报告哈希(verified)。
+    4. 整改重提后(REJECTED → ANCHORED)允许重新预检:旧结论自动归档到
+       aiChecks 历史列表,新结论覆盖 aiCheck,历史永不丢失;
+    5. 监管方可核验报告哈希(verified)。
 
   设计说明:AI 预检是"链下智能 + 链上存证"的辅助环节 —— 结论不改变批次
-  状态机,核对人在签名前可查看风险提示,自行决定继续签名或发起修改。
+  状态机,核对人在签名前可查看风险提示,自行决定继续签名、驳回或发起修改。
   =========================================================================== -->
 
 <script setup>
@@ -99,6 +101,13 @@ function levelTagType(level) {
   if (level === 'WARN') return 'warning';
   return 'success';
 }
+
+/** 批次状态 → 标签样式:REJECTED 红色、ANCHORED/PENDING 黄色、其余绿色 */
+function statusTagType(status) {
+  if (status === 'REJECTED') return 'danger';
+  if (status === 'ANCHORED' || status === 'PENDING') return 'warning';
+  return 'success';
+}
 </script>
 
 <template>
@@ -123,7 +132,7 @@ function levelTagType(level) {
         <el-descriptions :column="2" border size="small" class="batch-desc">
           <el-descriptions-item label="批次号">{{ batch.batchId }}</el-descriptions-item>
           <el-descriptions-item label="状态">
-            <el-tag :type="batch.status === 'ANCHORED' ? 'warning' : 'success'">
+            <el-tag :type="statusTagType(batch.status)">
               {{ batch.status }}
             </el-tag>
           </el-descriptions-item>
@@ -132,7 +141,7 @@ function levelTagType(level) {
         <!-- 已预检:只读展示存证结论 -->
         <template v-if="batch.aiCheck">
           <el-divider content-position="left">AI 预检存证(链上)</el-divider>
-          <el-descriptions :column="2" border size="small">
+          <el-descriptions :column="2" border size="small" class="ai-desc">
             <el-descriptions-item label="风险评分">
               {{ batch.aiCheck.riskScore }} / 100
             </el-descriptions-item>
@@ -189,21 +198,33 @@ function levelTagType(level) {
 
           <div class="action-row">
             <el-button @click="doQuery">重新核验</el-button>
-            <el-link type="primary" :href="ipfsUrl(batch.aiCheck.reportCid)" target="_blank">
+            <el-link
+              type="primary"
+              :href="ipfsUrl(batch.aiCheck.reportCid, `ai-report-${batch.batchId}.json`)"
+              target="_blank"
+            >
               查看完整 AI 分析报告(IPFS)
             </el-link>
           </div>
         </template>
 
-        <!-- ANCHORED 且未预检:结构化数据表单 -->
-        <template v-else-if="batch.status === 'ANCHORED'">
+        <!-- ANCHORED:结构化数据表单(已预检也可重新预检,旧结论归档) -->
+        <template v-if="batch.status === 'ANCHORED'">
           <el-divider content-position="left">录入结构化检测数据,触发链下 AI 分析</el-divider>
-          <el-form label-width="120px" class="ai-form">
+          <el-alert
+            v-if="batch.aiCheck"
+            type="warning"
+            show-icon
+            :closable="false"
+            class="recheck-tip"
+            title="该批次已有 AI 预检结论。整改重提后可重新预检,旧结论将归档到历史列表(链上保留,不覆盖)。"
+          />
+          <el-form label-width="200px" class="ai-form">
             <el-form-item label="产地">
-              <el-input v-model="form.origin" placeholder="如 山东寿光" style="width: 260px" />
+              <el-input v-model="form.origin" placeholder="如 山东寿光" style="width: 280px" />
             </el-form-item>
             <el-form-item label="产品类型">
-              <el-input v-model="form.produceType" placeholder="如 叶菜类" style="width: 260px" />
+              <el-input v-model="form.produceType" placeholder="如 叶菜类" style="width: 280px" />
             </el-form-item>
             <el-form-item label="农药残留(mg/kg)">
               <el-input-number v-model="form.pesticideResidue" :min="0" :step="0.01" :precision="4" />
@@ -233,9 +254,9 @@ function levelTagType(level) {
           </el-form>
         </template>
 
-        <!-- 其他状态:提示不支持 -->
+        <!-- 其他状态且未预检:提示不支持 -->
         <el-alert
-          v-else
+          v-else-if="!batch.aiCheck"
           type="info"
           show-icon
           :closable="false"
@@ -259,7 +280,12 @@ function levelTagType(level) {
   margin: 16px 0;
 }
 .ai-form {
-  max-width: 560px;
+  max-width: 880px;
+}
+/* 存证展示:label 不换行保持完整宽度(长文本换行已由全局样式处理) */
+.ai-desc :deep(.el-descriptions__label) {
+  white-space: nowrap;
+  min-width: 104px;
 }
 .field-hint {
   margin-left: 12px;
@@ -271,7 +297,7 @@ function levelTagType(level) {
 }
 .detail-table {
   margin: 12px 0;
-  max-width: 640px;
+  width: 100%;
 }
 .no-flag {
   color: #67c23a;
@@ -282,5 +308,8 @@ function levelTagType(level) {
   align-items: center;
   gap: 16px;
   margin-top: 16px;
+}
+.recheck-tip {
+  margin-bottom: 12px;
 }
 </style>

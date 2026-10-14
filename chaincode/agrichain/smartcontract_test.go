@@ -115,7 +115,7 @@ func TestCounterSign_ExpiredTimestamp(t *testing.T) {
 
 	// 用远早于交易时间的旧时间戳签名(超出容差)
 	staleTs := txSeconds(t, stub) - TimestampToleranceSeconds - 1
-	staleSig := signForBatch(t, checker.key, "B001", "QmSampleCidV1", staleTs)
+	staleSig := signForBatch(t, checker.key, SignKindCounterSign, "B001", "QmSampleCidV1", staleTs)
 	msg := mustInvokeFail(t, stub, "CounterSign", "B001", staleSig, int64ToStr(staleTs))
 	if !strings.Contains(msg, "偏差超过") {
 		t.Fatalf("超容差时间戳应被拒绝,实际: %s", msg)
@@ -130,9 +130,9 @@ func TestCounterSign_ValidSignature(t *testing.T) {
 	// 前置状态:operator 已锚定 v1(直接预置 ANCHORED 批次)
 	seedBatch(t, stub, sampleBatch("B001", StatusAnchored))
 
-	// 核对人用自己私钥对 <B001|QmSampleCidV1|clientTimestamp> 签名
+	// 核对人用自己私钥对 <SIGN|B001|QmSampleCidV1|clientTimestamp> 签名
 	ts := txSeconds(t, stub)
-	sig := signForBatch(t, checker.key, "B001", "QmSampleCidV1", ts)
+	sig := signForBatch(t, checker.key, SignKindCounterSign, "B001", "QmSampleCidV1", ts)
 
 	payload := mustInvokeOK(t, stub, "CounterSign", "B001", sig, int64ToStr(ts))
 	var out ProductBatch
@@ -157,7 +157,7 @@ func TestCounterSign_TamperedSignature(t *testing.T) {
 
 	// 故意对错误的数据包(错误 CID)签名,模拟篡改
 	ts := txSeconds(t, stub)
-	tampered := signForBatch(t, checker.key, "B001", "QmTamperedCid", ts)
+	tampered := signForBatch(t, checker.key, SignKindCounterSign, "B001", "QmTamperedCid", ts)
 	msg := mustInvokeFail(t, stub, "CounterSign", "B001", tampered, int64ToStr(ts))
 	if !strings.Contains(msg, "验签失败") {
 		t.Fatalf("篡改签名应验签失败,实际: %s", msg)
@@ -173,7 +173,7 @@ func TestCounterSign_WrongRole(t *testing.T) {
 	operator := newTestIdentity(t, Org1MSP, RoleOperator)
 	stub := newStubWithIdentity(t, operator)
 	seedBatch(t, stub, sampleBatch("B001", StatusAnchored))
-	sig := signForBatch(t, operator.key, "B001", "QmSampleCidV1", txSeconds(t, stub))
+	sig := signForBatch(t, operator.key, SignKindCounterSign, "B001", "QmSampleCidV1", txSeconds(t, stub))
 	msg := mustInvokeFail(t, stub, "CounterSign", "B001", sig, int64ToStr(txSeconds(t, stub)))
 	if !strings.Contains(msg, "权限不足") {
 		t.Fatalf("非核对人签名应被拒绝,实际: %s", msg)
@@ -200,7 +200,7 @@ func TestCounterSign_WrongState(t *testing.T) {
 				seedBatch(t, stub, sampleBatch("B001", c.status))
 			}
 			ts := txSeconds(t, stub)
-			sig := signForBatch(t, checker.key, "B001", "QmSampleCidV1", ts)
+			sig := signForBatch(t, checker.key, SignKindCounterSign, "B001", "QmSampleCidV1", ts)
 			msg := mustInvokeFail(t, stub, "CounterSign", "B001", sig, int64ToStr(ts))
 			// 批次不存在时报"不存在",状态不符时报"仅 xxx 状态可核对签名"
 			if !strings.Contains(msg, "仅") && !strings.Contains(msg, "不存在") {
@@ -411,7 +411,7 @@ func TestFinalized_WritesRejected(t *testing.T) {
 	// 切换为核对人身份,再尝试各种写操作,均被拒绝
 	stub.Creator = checker.creator
 	ts := txSeconds(t, stub)
-	sig := signForBatch(t, checker.key, "B001", "QmSampleCidV1", ts)
+	sig := signForBatch(t, checker.key, SignKindCounterSign, "B001", "QmSampleCidV1", ts)
 	if msg := mustInvokeFail(t, stub, "CounterSign", "B001", sig, int64ToStr(ts)); !strings.Contains(msg, "仅") {
 		t.Fatalf("锁定后核对应被拒绝,实际: %s", msg)
 	}
@@ -464,6 +464,8 @@ func TestRegulator_CanQueryButCannotWrite(t *testing.T) {
 		{"AnchorData", []string{"B002", "QmCidV1", "sha256-001"}},
 		{"RecordAICheck", []string{"B001", "QmAiReport", "aabb", "45", "[]", "rule-engine-v1"}},
 		{"CounterSign", []string{"B001", "deadbeef", "1700000000"}},
+		{"RejectCounterSign", []string{"B001", "不合格", "deadbeef", "1700000000"}},
+		{"ResubmitData", []string{"B001", "QmCidV2", "sha256-002", "已整改"}},
 		{"RequestModification", []string{"B001", "QmCidV2", "sha256-002", "x"}},
 		{"ApproveModification", []string{"B001", "true"}},
 		{"FinalizeBatch", []string{"B001"}},
@@ -478,11 +480,26 @@ func TestRegulator_CanQueryButCannotWrite(t *testing.T) {
 // 7. 查询与验证类
 // ---------------------------------------------------------------------------
 
-// TestVerifyBatch_MatchMismatch:哈希一致返回 MATCH,不一致返回 MISMATCH。
+// TestVerifyBatch_MatchMismatch:仅 FINALIZED 批次可验证 —— 哈希一致返回 MATCH,
+// 不一致返回 MISMATCH;未签发状态(ANCHORED/REJECTED 等)验证被拒。
 func TestVerifyBatch_MatchMismatch(t *testing.T) {
 	operator := newTestIdentity(t, Org1MSP, RoleOperator)
+	auditor := newTestIdentity(t, Org1MSP, RoleAuditor)
 	stub := newStubWithIdentity(t, operator)
 	mustInvokeOK(t, stub, "AnchorData", "B001", "QmCidV1", "sha256-001")
+
+	// 未签发(ANCHORED):不可对外验证
+	msg := mustInvokeFail(t, stub, "VerifyBatch", "B001", "sha256-001")
+	if !strings.Contains(msg, "尚未锁定签发") {
+		t.Fatalf("未签发批次验证应提示不可验证,实际: %s", msg)
+	}
+
+	// 审核人锁定后(快速构造:置为 COUNTER_SIGNED 再锁定)方可验证
+	pre := stateBatch(t, stub, "B001")
+	pre.Status = StatusCounterSigned
+	seedBatch(t, stub, pre)
+	stub.Creator = auditor.creator
+	mustInvokeOK(t, stub, "FinalizeBatch", "B001")
 
 	if got := string(mustInvokeOK(t, stub, "VerifyBatch", "B001", "sha256-001")); !strings.Contains(got, "MATCH") {
 		t.Fatalf("哈希一致应返回 MATCH,实际: %s", got)
@@ -645,15 +662,26 @@ func TestRecordAICheck_WrongState(t *testing.T) {
 	}
 }
 
-// TestRecordAICheck_Duplicate:每批次仅允许一次预检,重复触发被拒绝(证据不可覆盖)。
-func TestRecordAICheck_Duplicate(t *testing.T) {
+// TestRecordAICheck_ArchiveOnResubmit:整改重提后再次预检,旧结论归档到
+// AIChecks 保留(证据不覆盖),最新结论写入 aiCheck —— 全程可追溯。
+func TestRecordAICheck_ArchiveOnResubmit(t *testing.T) {
 	operator := newTestIdentity(t, Org1MSP, RoleOperator)
 	stub := newStubWithIdentity(t, operator)
 	seedBatch(t, stub, sampleBatch("B001", StatusAnchored))
-	mustInvokeOK(t, stub, "RecordAICheck", "B001", "QmAiReport", "aabb", "45", "[]", "rule-engine-v1")
-	msg := mustInvokeFail(t, stub, "RecordAICheck", "B001", "QmAiReport2", "ccdd", "10", "[]", "rule-engine-v1")
-	if !strings.Contains(msg, "已完成 AI 预检") {
-		t.Fatalf("重复预检应被拒绝,实际: %s", msg)
+	mustInvokeOK(t, stub, "RecordAICheck", "B001", "QmAiReport1", "aabb", "45", "[]", "rule-engine-v1")
+
+	// 同一 ANCHORED 状态下再次预检(整改重提后的场景):旧结论归档,新结论生效
+	mustInvokeOK(t, stub, "RecordAICheck", "B001", "QmAiReport2", "ccdd", "10", "[]", "rule-engine-v1")
+
+	batch := stateBatch(t, stub, "B001")
+	if batch.AICheck == nil || batch.AICheck.ReportCid != "QmAiReport2" {
+		t.Fatalf("最新预检结论应为 QmAiReport2,实际 %+v", batch.AICheck)
+	}
+	if len(batch.AIChecks) != 1 || batch.AIChecks[0].ReportCid != "QmAiReport1" {
+		t.Fatalf("旧结论应归档到 AIChecks 保留,实际 %+v", batch.AIChecks)
+	}
+	if batch.Status != StatusAnchored {
+		t.Fatalf("AI 预检不改变状态机,实际 %s", batch.Status)
 	}
 }
 
@@ -669,5 +697,227 @@ func TestRecordAICheck_InvalidScore(t *testing.T) {
 				t.Fatalf("越界评分应被拒绝,实际: %s", msg)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 9. RejectCounterSign 核对驳回(核对人,链上验签)
+// ---------------------------------------------------------------------------
+
+// TestRejectCounterSign_HappyPath:核对人签名驳回 → 状态 REJECTED,原因与
+// 驳回人留痕,驳回历史追加到 Rejections(不可覆盖)。
+func TestRejectCounterSign_HappyPath(t *testing.T) {
+	checker := newTestIdentity(t, Org1MSP, RoleChecker)
+	stub := newStubWithIdentity(t, checker)
+	seedBatch(t, stub, sampleBatch("B001", StatusAnchored))
+
+	ts := txSeconds(t, stub)
+	sig := signForBatch(t, checker.key, SignKindReject, "B001", "QmSampleCidV1", ts)
+	payload := mustInvokeOK(t, stub, "RejectCounterSign", "B001", "农残超标,退回整改", sig, int64ToStr(ts))
+
+	var out ProductBatch
+	if err := json.Unmarshal(payload, &out); err != nil {
+		t.Fatalf("返回负载应为 ProductBatch JSON: %v", err)
+	}
+	batch := stateBatch(t, stub, "B001")
+	if batch.Status != StatusRejected {
+		t.Fatalf("状态应为 %s,实际 %s", StatusRejected, batch.Status)
+	}
+	if len(batch.Rejections) != 1 {
+		t.Fatalf("驳回历史应有 1 条,实际 %d", len(batch.Rejections))
+	}
+	r := batch.Rejections[0]
+	if r.Reason != "农残超标,退回整改" || r.RejectedBy == "" || r.RejectedAt == "" {
+		t.Fatalf("驳回记录应完整留痕,实际 %+v", r)
+	}
+}
+
+// TestRejectCounterSign_EmptyReason:驳回原因必填,空原因被拒(链上需留痕)。
+func TestRejectCounterSign_EmptyReason(t *testing.T) {
+	checker := newTestIdentity(t, Org1MSP, RoleChecker)
+	stub := newStubWithIdentity(t, checker)
+	seedBatch(t, stub, sampleBatch("B001", StatusAnchored))
+	msg := mustInvokeFail(t, stub, "RejectCounterSign", "B001", "", "deadbeef", "1700000000")
+	if !strings.Contains(msg, "驳回原因") {
+		t.Fatalf("空原因应被拒绝,实际: %s", msg)
+	}
+}
+
+// TestRejectCounterSign_WrongRole:录入人(非核对人)驳回被角色断言拒绝。
+func TestRejectCounterSign_WrongRole(t *testing.T) {
+	operator := newTestIdentity(t, Org1MSP, RoleOperator)
+	stub := newStubWithIdentity(t, operator)
+	seedBatch(t, stub, sampleBatch("B001", StatusAnchored))
+	ts := txSeconds(t, stub)
+	sig := signForBatch(t, operator.key, SignKindReject, "B001", "QmSampleCidV1", ts)
+	msg := mustInvokeFail(t, stub, "RejectCounterSign", "B001", "不合格", sig, int64ToStr(ts))
+	if !strings.Contains(msg, "权限不足") {
+		t.Fatalf("非核对人驳回应被拒绝,实际: %s", msg)
+	}
+}
+
+// TestRejectCounterSign_WrongState:非 ANCHORED 状态驳回被拒(已签名/驳回/锁定)。
+func TestRejectCounterSign_WrongState(t *testing.T) {
+	checker := newTestIdentity(t, Org1MSP, RoleChecker)
+	cases := []struct {
+		name   string
+		status string
+	}{
+		{"已核对过(COUNTER_SIGNED)", StatusCounterSigned},
+		{"已驳回(REJECTED)", StatusRejected},
+		{"已锁定(FINALIZED)", StatusFinalized},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			stub := newStubWithIdentity(t, checker)
+			seedBatch(t, stub, sampleBatch("B001", c.status))
+			ts := txSeconds(t, stub)
+			sig := signForBatch(t, checker.key, SignKindReject, "B001", "QmSampleCidV1", ts)
+			msg := mustInvokeFail(t, stub, "RejectCounterSign", "B001", "不合格", sig, int64ToStr(ts))
+			if !strings.Contains(msg, "仅") {
+				t.Fatalf("错误状态驳回应被拒绝,实际: %s", msg)
+			}
+		})
+	}
+}
+
+// TestRejectCounterSign_CrossKindReplay:用签名通过(SIGN)用途的签名发起驳回,
+// 数据包 kind 不符 → 验签失败(防跨用途重放)。
+func TestRejectCounterSign_CrossKindReplay(t *testing.T) {
+	checker := newTestIdentity(t, Org1MSP, RoleChecker)
+	stub := newStubWithIdentity(t, checker)
+	seedBatch(t, stub, sampleBatch("B001", StatusAnchored))
+	ts := txSeconds(t, stub)
+	signKindSig := signForBatch(t, checker.key, SignKindCounterSign, "B001", "QmSampleCidV1", ts)
+	msg := mustInvokeFail(t, stub, "RejectCounterSign", "B001", "不合格", signKindSig, int64ToStr(ts))
+	if !strings.Contains(msg, "验签失败") {
+		t.Fatalf("跨用途签名重放应验签失败,实际: %s", msg)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 10. ResubmitData 整改重提(录入人)
+// ---------------------------------------------------------------------------
+
+// TestResubmitData_HappyPath:驳回后录入人重提整改版 → 状态回 ANCHORED,
+// 新版本追加生效、旧版本 DEPRECATED 保留、整改说明留痕、驳回历史不删除。
+func TestResubmitData_HappyPath(t *testing.T) {
+	operator := newTestIdentity(t, Org1MSP, RoleOperator)
+	stub := newStubWithIdentity(t, operator)
+	rejected := sampleBatch("B001", StatusRejected)
+	rejected.Rejections = []*Rejection{{
+		Reason:     "农残超标",
+		RejectedBy: "checker",
+		RejectedAt: "2026-01-01T00:00:00Z",
+	}}
+	seedBatch(t, stub, rejected)
+
+	mustInvokeOK(t, stub, "ResubmitData", "B001", "QmCidV2", "sha256-002", "已复检整改")
+
+	batch := stateBatch(t, stub, "B001")
+	if batch.Status != StatusAnchored {
+		t.Fatalf("重提后状态应回 %s,实际 %s", StatusAnchored, batch.Status)
+	}
+	if batch.CurrentVersion != 2 || len(batch.Versions) != 2 {
+		t.Fatalf("重提应追加版本,实际 version=%d len=%d", batch.CurrentVersion, len(batch.Versions))
+	}
+	v1, v2 := batch.Versions[0], batch.Versions[1]
+	if v1.Status != VersionDeprecated || v1.Cid != "QmSampleCidV1" {
+		t.Fatalf("旧版本应归档且内容保留,实际 %+v", v1)
+	}
+	if v2.Status != VersionActive || v2.Cid != "QmCidV2" || v2.Reason != "已复检整改" {
+		t.Fatalf("整改版内容不符: %+v", v2)
+	}
+	if len(batch.Rejections) != 1 || batch.Rejections[0].Reason != "农残超标" {
+		t.Fatalf("驳回历史应保留,实际 %+v", batch.Rejections)
+	}
+}
+
+// TestResubmitData_WrongRole:核对人(非录入人)重提被拒。
+func TestResubmitData_WrongRole(t *testing.T) {
+	checker := newTestIdentity(t, Org1MSP, RoleChecker)
+	stub := newStubWithIdentity(t, checker)
+	seedBatch(t, stub, sampleBatch("B001", StatusRejected))
+	msg := mustInvokeFail(t, stub, "ResubmitData", "B001", "QmCidV2", "sha256-002", "已整改")
+	if !strings.Contains(msg, "权限不足") {
+		t.Fatalf("非录入人重提应被拒绝,实际: %s", msg)
+	}
+}
+
+// TestResubmitData_WrongState:非 REJECTED 状态重提被拒(未驳回不可重提)。
+func TestResubmitData_WrongState(t *testing.T) {
+	operator := newTestIdentity(t, Org1MSP, RoleOperator)
+	for _, status := range []string{StatusAnchored, StatusCounterSigned, StatusPending, StatusFinalized} {
+		t.Run("status="+status, func(t *testing.T) {
+			stub := newStubWithIdentity(t, operator)
+			seedBatch(t, stub, sampleBatch("B001", status))
+			msg := mustInvokeFail(t, stub, "ResubmitData", "B001", "QmCidV2", "sha256-002", "已整改")
+			if !strings.Contains(msg, "仅") {
+				t.Fatalf("非驳回状态重提应被拒绝,实际: %s", msg)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 11. 驳回-整改-重签-签发 全闭环
+// ---------------------------------------------------------------------------
+
+// TestRejectResubmitLoop_ClosedLoop:完整闭环 —— 锚定 → 预检(HIGH)→ 核对驳回 →
+// 录入人整改重提 → 再次预检 → 核对重新签名 → 审核人锁定签发 → 消费者验证 MATCH,
+// 驳回历史与预检历史全程可审计。
+func TestRejectResubmitLoop_ClosedLoop(t *testing.T) {
+	operator := newTestIdentity(t, Org1MSP, RoleOperator)
+	checker := newTestIdentity(t, Org1MSP, RoleChecker)
+	auditor := newTestIdentity(t, Org1MSP, RoleAuditor)
+	stub := newStubWithIdentity(t, operator)
+
+	// 1. 录入人锚定 + AI 预检(高风险)
+	mustInvokeOK(t, stub, "AnchorData", "B001", "QmCidV1", "sha256-001")
+	mustInvokeOK(t, stub, "RecordAICheck", "B001", "QmAiReport1", "aabb", "60", `["农残严重超标"]`, "rule-engine-v1")
+
+	// 2. 核对人看到 HIGH 告警后签名驳回(附原因)
+	stub.Creator = checker.creator
+	ts := txSeconds(t, stub)
+	// 注意:驳回签名对象绑定当前版本 v1 的 CID
+	rejectSig := signForBatch(t, checker.key, SignKindReject, "B001", "QmCidV1", ts)
+	mustInvokeOK(t, stub, "RejectCounterSign", "B001", "农残超标,退回整改", rejectSig, int64ToStr(ts))
+
+	// 3. 驳回状态不可对外验证(不合格未签发)
+	if msg := mustInvokeFail(t, stub, "VerifyBatch", "B001", "sha256-001"); !strings.Contains(msg, "驳回") {
+		t.Fatalf("驳回批次验证应提示未签发,实际: %s", msg)
+	}
+
+	// 4. 录入人整改重提(v2 追加),再次预检(旧结论归档)
+	stub.Creator = operator.creator
+	mustInvokeOK(t, stub, "ResubmitData", "B001", "QmCidV2", "sha256-002", "已复检整改")
+	mustInvokeOK(t, stub, "RecordAICheck", "B001", "QmAiReport2", "ccdd", "0", "[]", "rule-engine-v1")
+
+	// 5. 核对人对整改版重新签名(绑定 v2 CID)
+	stub.Creator = checker.creator
+	ts2 := txSeconds(t, stub)
+	signSig := signForBatch(t, checker.key, SignKindCounterSign, "B001", "QmCidV2", ts2)
+	mustInvokeOK(t, stub, "CounterSign", "B001", signSig, int64ToStr(ts2))
+
+	// 6. 审核人锁定签发,消费者验证 MATCH
+	stub.Creator = auditor.creator
+	mustInvokeOK(t, stub, "FinalizeBatch", "B001")
+	if got := string(mustInvokeOK(t, stub, "VerifyBatch", "B001", "sha256-002")); !strings.Contains(got, "MATCH") {
+		t.Fatalf("整改版签发后应验证 MATCH,实际: %s", got)
+	}
+
+	// 7. 全链路审计:驳回历史、预检归档、版本历史全部保留
+	batch := stateBatch(t, stub, "B001")
+	if len(batch.Rejections) != 1 || batch.Rejections[0].Reason != "农残超标,退回整改" {
+		t.Fatalf("驳回历史应保留,实际 %+v", batch.Rejections)
+	}
+	if len(batch.AIChecks) != 1 || batch.AIChecks[0].RiskLevel != RiskLevelHigh {
+		t.Fatalf("旧预检结论(HIGH)应归档,实际 %+v", batch.AIChecks)
+	}
+	if batch.AICheck == nil || batch.AICheck.RiskLevel != RiskLevelNormal {
+		t.Fatalf("最新预检结论应为 NORMAL,实际 %+v", batch.AICheck)
+	}
+	if len(batch.Versions) != 2 || batch.Versions[0].Status != VersionDeprecated {
+		t.Fatalf("版本历史应完整保留,实际 %+v", batch.Versions)
 	}
 }

@@ -37,10 +37,9 @@ backend/
 ## 2. 启动步骤
 
 ```bash
-# 0) 前置:网络已启动、链码已部署、IPFS 已启动(见 network/README.md)
-cd network && ./network.sh up createChannel -ca
-./network.sh deployCC -ccn agrichain -ccp ../chaincode/agrichain -ccl go
-docker run -d --name ipfs -p 5001:5001 -p 8080:8080 ipfs/kubo
+# 0) 前置:网络已启动、链码已部署、IPFS 已启动
+#   推荐一键完成:cd .. && ./scripts/envctl.sh deploy
+#   (手动方式见 network/README.md:up createChannel + deployCC + docker run ipfs)
 
 # 1) 安装依赖
 cd ../backend
@@ -175,9 +174,8 @@ npm test
 
 **前置条件(缺一不可)**:
 
-1. 网络与链码:`cd network && ./network.sh up createChannel -ca` 且 `./network.sh deployCC -ccn agrichain -ccp ../chaincode/agrichain -ccl go -ccs 3`
-2. IPFS:`docker run -d --name ipfs -p 5001:5001 -p 8080:8080 ipfs/kubo`
-3. 后端:`cd backend && npm install && npm run setup-wallet`
+1. 网络与链码/IPFS:仓库根目录 `./scripts/envctl.sh deploy` 一键完成(或手动:`cd network && ./network.sh up createChannel -ca` + `deployCC` + `docker run ipfs`)
+2. 后端:`cd backend && npm install && npm run setup-wallet`(deploy 已含这两步,可跳过)
 
 **运行**:
 

@@ -42,3 +42,6 @@ chaincode/agrichain/vendor/
 .tmp-*
 /bin
 /config
+
+# ---- 启停脚本运行时产物(日志/PID) ----
+/logs

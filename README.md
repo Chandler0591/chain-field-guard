@@ -19,12 +19,12 @@
 
 ## 核心业务流程
 
-批次状态机：`INIT → ANCHORED → COUNTER_SIGNED ⇄ PENDING → FINALIZED`
+批次状态机:`INIT → ANCHORED ⇄ REJECTED → COUNTER_SIGNED ⇄ PENDING → FINALIZED`
 
 1. **数据锚定(录入人)**:文件上传 IPFS 得 CID,计算 SHA-256,调用 `AnchorData` 写入链上
 2. **AI 预检(录入人,链下智能 + 链上存证)**:可插拔引擎分析结构化检测数据(农残/铅/水分/菌落总数/亚硝酸盐),完整报告(含各维度得分明细)存 IPFS,结论哈希由 `RecordAICheck` 上链 —— 不改变状态机,仅作辅助证据
-3. **二级签名(核对人)**:查看 AI 风险提示后人工复核,对数据包签名,调用 `CounterSign` 永久上链
-4. **修改复核(录入人/审核人)**:`RequestModification` 发起追加式修改请求,`ApproveModification` 批准或拒绝,旧版本标记 `DEPRECATED`,不覆盖
+3. **二级签名(核对人)**:查看 AI 风险提示后人工复核,对数据包签名,调用 `CounterSign` 永久上链;认定不合格可 `RejectCounterSign` 驳回(REJECTED,原因链上留痕,录入人整改后可 `ResubmitData` 重提)
+4. **修改复核(录入人/审核人)**:`RequestModification` 发起追加式修改请求,`ApproveModification` 批准或拒绝(批准后状态回 COUNTER_SIGNED),旧版本标记 `DEPRECATED`,不覆盖
 5. **锁定与凭证(审核人)**:`FinalizeBatch` 锁定批次、拒绝后续写入,生成唯一数字凭证 ID
 6. **验证与审计(消费者/监管)**:`VerifyBatch` 重算哈希比对链上,`GetAllVersions` 查询全版本历史;监管方可凭 AI 报告 CID 取回原文并核验哈希,追溯 AI 判断依据
 
@@ -41,9 +41,11 @@ chain-field-guard/
 
 ## 当前状态
 
-✅ 阶段 1~5 代码已全部交付(网络 / 链码 / 后端 / 前端 / 演示脚本与部署手册),并已加入 **AI 异常检测环节**(链下智能分析 + 结论哈希上链存证,辅助人工决策),待你按部署手册在自建环境中跑通验证。另补充**网络配置原理导读**(组织动态扩展专题),补齐三阶段学习路线中阶段 2 的知识缺口。
+✅ 阶段 1~5 代码已全部交付(网络 / 链码 / 后端 / 前端 / 演示脚本与部署手册),并已加入 **AI 异常检测环节**(链下智能分析 + 结论哈希上链存证,辅助人工决策)与 **核对驳回-整改重提闭环**(REJECTED ⇄ ANCHORED,驳回与整改全程留痕)。
 
-✅ **AI 能力深化**已完成:引擎可插拔(provider 模式 + mock 模型服务 + 失败自动降级)、新增菌落总数/亚硝酸盐检测维度、各维度得分明细可视化、HIGH 风险红色告警闭环叙事;后端单测 44 用例、e2e 15 用例、demo 脚本 11 环节。
+✅ 一键部署与日常启停:`./scripts/envctl.sh deploy|start|stop|restart|status|clean` 管理全部组件(网络/链码/IPFS/前后端),IPFS 数据卷持久化。
+
+✅ **测试基线**:链码单测 39 个测试函数、后端单测 45 用例、端到端 e2e 25 用例、demo 脚本全流程,全部通过。
 
 - 实现计划:[docs/00-实现计划.md](docs/00-实现计划.md)
 - 环境搭建:[docs/01-环境搭建.md](docs/01-环境搭建.md)

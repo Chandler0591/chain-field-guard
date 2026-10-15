@@ -16,6 +16,7 @@
 import { ref } from 'vue';
 import { ElMessage } from 'element-plus';
 import { getBatch, aiCheck, getAiCheck, ipfsUrl } from '../api/index.js';
+import { roleStore } from '../store/role.js';
 
 const batchId = ref(''); // 查询批次号
 const batch = ref(null); // 批次详情(状态 + aiCheck)
@@ -208,8 +209,35 @@ function statusTagType(status) {
           </div>
         </template>
 
-        <!-- ANCHORED:结构化数据表单(已预检也可重新预检,旧结论归档) -->
-        <template v-if="batch.status === 'ANCHORED'">
+        <!-- 历史预检归档:整改重提后重新预检时,旧结论归档于 aiChecks(链上保留,不覆盖) -->
+        <template v-if="batch.aiChecks && batch.aiChecks.length">
+          <el-divider content-position="left">历史预检归档(旧结论链上保留,不覆盖)</el-divider>
+          <el-table :data="batch.aiChecks" size="small" border class="history-table">
+            <el-table-column prop="checkedAt" label="预检时间" width="170" />
+            <el-table-column label="风险评分" width="90">
+              <template #default="{ row }">{{ row.riskScore }} / 100</template>
+            </el-table-column>
+            <el-table-column label="风险等级" width="100">
+              <template #default="{ row }">
+                <el-tag :type="levelTagType(row.riskLevel)" size="small">{{ row.riskLevel }}</el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="异常项">
+              <template #default="{ row }">
+                <span v-if="!row.flags || !row.flags.length" class="no-flag">无异常</span>
+                <template v-else>
+                  <el-tag v-for="f in row.flags" :key="f" type="danger" effect="plain" size="small" class="flag-tag">
+                    {{ f }}
+                  </el-tag>
+                </template>
+              </template>
+            </el-table-column>
+            <el-table-column prop="modelVersion" label="模型版本" width="150" />
+          </el-table>
+        </template>
+
+        <!-- ANCHORED:结构化数据表单(仅录入人可触发;监管方只读查询/核验/看历史) -->
+        <template v-if="batch.status === 'ANCHORED' && roleStore.role === 'operator'">
           <el-divider content-position="left">录入结构化检测数据,触发链下 AI 分析</el-divider>
           <el-alert
             v-if="batch.aiCheck"
@@ -254,13 +282,17 @@ function statusTagType(status) {
           </el-form>
         </template>
 
-        <!-- 其他状态且未预检:提示不支持 -->
+        <!-- 其他状态且未预检:提示不支持;监管方不可触发时也给出说明 -->
         <el-alert
           v-else-if="!batch.aiCheck"
           type="info"
           show-icon
           :closable="false"
-          title="AI 预检仅支持 ANCHORED 状态(锚定之后、核对签名之前),当前状态不支持。"
+          :title="
+            roleStore.role === 'operator'
+              ? 'AI 预检仅支持 ANCHORED 状态(锚定之后、核对签名之前),当前状态不支持。'
+              : '当前角色为监管方,只读查看 AI 预检存证与历史归档,不触发预检。'
+          "
         />
       </template>
 
@@ -308,6 +340,10 @@ function statusTagType(status) {
   align-items: center;
   gap: 16px;
   margin-top: 16px;
+}
+.history-table {
+  margin: 12px 0;
+  width: 100%;
 }
 .recheck-tip {
   margin-bottom: 12px;

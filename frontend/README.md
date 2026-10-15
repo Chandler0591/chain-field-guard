@@ -30,6 +30,7 @@ frontend/
 ```bash
 # 前置:后端已启动(见 backend/README.md),即 backend 目录下 npm start 后
 # curl http://127.0.0.1:3000/api/health 返回 healthy
+# (一键方式:仓库根目录 ./scripts/envctl.sh deploy/start 已含前端启动)
 
 cd frontend
 npm install
@@ -44,7 +45,7 @@ npm run dev
 | 页面 | 允许角色 | 对应链码函数 | 说明 |
 | :--- | :--- | :--- | :--- |
 | 上传锚定 | 录入人 operator | AnchorData | 上传 IPFS → 锚定上链(v1) |
-| AI 预检 | 录入人 operator | RecordAICheck | 录入结构化检测数据(农残/铅/水分/菌落总数/亚硝酸盐)→ 链下 AI 分析 → 结论哈希上链 + 各维度得分明细表(不改状态机;整改重提后可重新预检,旧结论归档) |
+| AI 预检 | 录入人 operator(触发)/监管方 regulator(只读核验) | RecordAICheck | 录入结构化检测数据(农残/铅/水分/菌落总数/亚硝酸盐)→ 链下 AI 分析 → 结论哈希上链 + 各维度得分明细表(不改状态机;整改重提后可重新预检,旧结论归档到 aiChecks,页面展示历史归档列表;监管方只读查看存证/历史并核验报告哈希) |
 | 核对签名 | 核对人 checker | CounterSign / RejectCounterSign | 预览文件 + 查看 AI 风险提示 → 人工复核:合格则后端签名上链,不合格则附原因驳回(REJECTED,原因留痕) |
 | 修改复核 | 录入人/核对人发起,审核人复核;录入人整改重提 | RequestModification / ApproveModification / ResubmitData | 追加式修改,旧版本 DEPRECATED;驳回后整改重提(REJECTED → ANCHORED) |
 | 锁定与凭证 | 审核人 auditor | FinalizeBatch | 锁定发证,凭证 ID + 二维码 |
@@ -65,7 +66,7 @@ npm run dev
    - 认定不合格 → 填驳回原因 → 核对驳回(REJECTED,原因链上留痕,页面展示驳回历史)
 5. **录入人(驳回整改,可选)**:修改复核页左侧显示驳回历史 → 上传整改版文件、填整改说明 → 整改重提(REJECTED → ANCHORED,v2 追加、v1 归档)→ 重新 AI 预检(旧结论归档 aiChecks)→ 回到步骤 4 重新核对
 6. **录入人**:修改复核页上传新版本文件 → 提交修改请求(PENDING)
-7. **审核人**:修改复核页查看请求 → 批准(版本 v2 追加,v1 标 DEPRECATED)
+7. **审核人**:修改复核页查看请求 → 批准(状态回 COUNTER_SIGNED,版本 v2 追加、v1 标 DEPRECATED)
 8. **审核人**:锁定与凭证页 → 锁定发证(FINALIZED,展示凭证二维码)
 9. **消费者**:消费者验证页输批次号 + 选文件 → MATCH(可再试篡改文件看 MISMATCH;未签发批次会明确提示不可验证)
 10. **监管方**:监管审计页查全版本历史(全部版本完整可见);AI 预检页可查看结论并核验报告哈希

@@ -24,7 +24,7 @@ const activeView = ref('anchor');
 // 业务菜单(与状态机环节一一对应)
 const MENUS = [
   { key: 'anchor', label: '上传锚定', component: AnchorView, roles: ['operator'] },
-  { key: 'ai', label: 'AI 预检', component: AiView, roles: ['operator'] },
+  { key: 'ai', label: 'AI 预检', component: AiView, roles: ['operator', 'regulator'] },
   { key: 'countersign', label: '核对签名', component: CounterSignView, roles: ['checker'] },
   { key: 'modify', label: '修改复核', component: ModifyView, roles: ['operator', 'checker', 'auditor'] },
   { key: 'finalize', label: '锁定与凭证', component: FinalizeView, roles: ['auditor'] },
